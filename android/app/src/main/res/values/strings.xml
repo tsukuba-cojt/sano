@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">回覧板</string>
+    <!-- 常駐通知（MeshService） -->
+    <string name="mesh_channel_name">すれ違い通信</string>
+    <string name="mesh_channel_description">近くの端末とお知らせを交換している間に表示されます</string>
+    <string name="mesh_notification_title">回覧板</string>
+    <string name="mesh_notification_text">近くの人と情報を交換しています</string>
+    <!-- 新しいお知らせの通知（NoticeNotifier） -->
+    <string name="notices_channel_name">新しい お知らせ</string>
+    <string name="notices_channel_description">新しい お知らせが 届いたときに 知らせます</string>
+    <string name="alerts_channel_name">避難・注意の お知らせ</string>
+    <string name="alerts_channel_description">公式の 避難情報・注意喚起を すぐに 知らせます</string>
+    <string name="quiet_channel_name">夜の お知らせ（音なし）</string>
+    <string name="quiet_channel_description">午後10時〜午前6時に 届いた お知らせを 音を 出さずに 知らせます</string>
+    <string name="low_channel_name">その他の お知らせ</string>
+    <string name="low_channel_description">「ぜんぶ 知らせる」を 選んだときに 住民の お知らせも 知らせます</string>
+    <string name="reminder_channel_name">月 1 回の 確認</string>
+    <string name="reminder_channel_description">アプリが 動いているか 月に 1 回 確かめるための 通知です</string>
+    <string name="reminder_default_title">回覧板の 確認です。災害では ありません</string>
+    <string name="reminder_default_body">開いて 動いているか 確かめてください</string>
+</resources>
