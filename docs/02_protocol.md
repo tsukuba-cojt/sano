@@ -1,0 +1,212 @@
+# 回覧板 ワイヤプロトコル仕様 v1（v2 改訂）
+
+全ての実装（Dart コア / Swift BLE / Kotlin BLE / テスト用フェイク）はこの文書に従う。
+バイト順は特記がない限り **リトルエンディアン**。
+
+v2 は [08_use_cases.md](08_use_cases.md) の仕様変更 C01〜C25 のうち、ワイヤ・同期・保存に関わるものを反映した版。変更・追加した行の末尾に「（v2: C13）」のように変更 id を付ける。正は `lib/core/envelope.dart`・`lib/core/frames.dart`・`lib/mesh/message_store.dart`・`lib/mesh/sync_session.dart`・`lib/mesh/mesh_node.dart`。変更の一覧は §6、caps / flags / kind / policy / フレーム種別の割り当て表は §7。（v2: C13）
+
+## 1. 識別子
+
+| 名前 | 値 |
+|---|---|
+| Service UUID | `6b616972-616e-4b41-4952-414e00000010` |
+| RX Characteristic（central → peripheral、Write Without Response、Write 可） | `6b616972-616e-4b41-4952-414e00000011` |
+| TX Characteristic（peripheral → central、Notify） | `6b616972-616e-4b41-4952-414e00000012` |
+| エポック（created_at / expires_at の起点） | 2026-01-01T00:00:00Z = Unix 1767225600 |
+| プロトコルバージョン | 1（当面 1 のまま送る。受信側は不一致でも切らない。能力は HELLO の caps で伝える）（v2: C13） |
+
+- 広告には **Service UUID のみ** を載せる（Local Name なし、Manufacturer Data なし）。iOS はバックグラウンドで UUID が overflow area に移るため、Android スキャナは Apple 製造者データ（Company ID 0x004C、先頭バイト 0x01）も候補として扱い、接続後にサービス探索で確認する。
+- 全 characteristic / 接続は平文（暗号化・ペアリング要求なし）。
+- ノード ID: 端末ごとに生成した 8 バイト乱数（永続）。
+
+## 2. メッセージ封筒（Envelope）
+
+```
+offset size  field
+0      1     magic      = 0x4B ('K')
+1      1     version    = 1
+2      1     kind       0=notice(お知らせ) 1=group_info(グループ情報) 2=tombstone(取り消し)
+                        3=help(困りごと) 4=ack(受け取りました)                       （v2: C21）
+3      1     flags      bit0: body が deflate+辞書 で圧縮されている
+                        bit1: supersedes フィールドあり
+                        bit2-7: 予約 (0)。訓練は見出しの接頭辞「【訓練】」で表し flags は使わない （v2: C23）
+4      3     group_id   uint24, 0..999999（6 桁の参加コードと同じ数）
+7      8     msg_id     uint64 = SHA-256(group_id(3) ‖ kind(1) ‖ origin_id(8) ‖ created_at(4)
+                        ‖ body_plain ‖ [supersedes(8 LE)]) の先頭 8 バイト。supersedes は あるときだけ含める （v2）
+15     4     created_at uint32, エポックからの秒
+19     4     expires_at uint32, エポックからの秒。中継時に残り時間へ書き換える（§2.3）   （v2: C12）
+23     1     hop        中継回数。発信時 0。受信側は保存時に +1。64 以上は中継しない
+24     1     category   後述
+25     1     role       0=住民 1=スタッフ 2=公式（発信者）
+26     2     body_len   uint16, 送信される body（圧縮後）のバイト長
+28     [8]   supersedes flags bit1 が立っているときのみ。上書き/取消対象の msg_id
+..     body_len  body
+```
+
+- ヘッダは 28 バイト（supersedes ありで 36）。**offset 0〜27 の位置と意味は将来の版でも変えない**（旧版が新版の封筒をヘッダだけで中継できるように。§2.1）。（v2: C13）
+- **msg_id は hop を含まない**（hop は中継ごとに変わる）。role / category も含まないが、受信側はこれらを「最初に受け取った値」で固定する。expires_at も含まないため、中継時の書き換え（§2.3）は msg_id に影響しない。supersedes は（あれば）含める。同じ端末が同じ秒に複数の取り消し・書きなおしを出しても ID が衝突しないようにするため。origin_id はワイヤに載らないので受信側は msg_id を再計算しない（v1 と互換）。（v2: C12, C13）
+- `kind=notice` の body（平文）は `u16 len + UTF-8` のフィールドを順に連結:
+  1. sender_name（発信元表示名、≤ 48 バイト）
+  2. title（見出し、≤ 120 バイト）
+  3. place（場所、≤ 120 バイト）
+  4. text（本文、≤ 3,000 バイト）
+  5 番目以降のフィールドは無視する（将来の定型見出し用。旧版・新版の相互運用のため末尾の余りを拒否しない）。（v2: C13, C25）
+- `kind=help` の body は notice と同形式。見出しに 6 択と場所・人数（例「【〇〇町2丁目】薬・医療が 必要（2〜3人）」）、sender_name・text は空。category=14 支援要請、role=0、有効期間 24 時間。表示するのはそのグループの公式・スタッフ端末だけで、住民端末は保存・中継のみ（表示上の分離であり秘匿ではない）。（v2: C21）
+- `kind=ack` の body は空。supersedes 必須（対象の help の msg_id）。「置き換え」扱いにはしない（対象は表示されたままで、詳細に「受け取りました」を示す）。（v2: C21）
+- `kind=group_info` の body（平文）: 同形式で 1. name（グループ名 ≤ 60 B）2. host_name（≤ 48 B）3. policy（1 バイト: bit0 = 参加者も投稿可、bit1 = 閉鎖（引っ越し済み）、bit2 = 困りごとを受け付ける）4. description（問い合わせ先・ひとこと ≤ 300 B）5. ext（省略可）: `u16 len ‖ code_digest 8 B ‖ generation u16 ‖ successor uint24`。code_digest = SHA-256(本部コード 8 桁 ASCII) 先頭 4 B ‖ SHA-256(スタッフコード 8 桁 ASCII) 先頭 4 B（全 0 は「なし」）。generation はコードの作り直し・引っ越しごとに +1。successor は後継の参加コード（0 = なし。999999 超は 0 扱い）。ext が 13 バイト未満なら ext なしとして読み、6 番目以降のフィールドは無視する。group_info は role=2 で発信され、expires_at は作成から 365 日。（v2: C24, C21）
+- `kind=tombstone` の body は空。supersedes 必須。受信側は対象 msg_id を「取り消し済み」として表示から外し、他人の notice は本文を消して空殻にする（§5）。（v2: C20）
+- 圧縮: `flags bit0` が立つ場合、body は **raw deflate（zlib ヘッダなし、windowBits=-15）+ 事前共有辞書**（`lib/core/dictionary.dart` の `kDictionaryV1`、UTF-8 バイト列）。伸長後サイズは **4,096 バイト上限**（超過は破棄）。圧縮しても縮まない場合は圧縮しない。
+
+### 2.1 受信側の検証（2 段）（v2: C13）
+
+| 段 | 条件 | 満たさないとき |
+|---|---|---|
+| 中継できる条件 | magic 一致、ヘッダ 28 B 以上（flags bit1 なら supersedes 8 B も揃っている）、body_len と実長の一致、body_len ≤ 4,096、expires_at ≥ created_at、group_id ≤ 999999。保存時はさらに hop < 64 と有効期間が §2.3 の範囲内 | 破棄（セッションは続ける） |
+| 表示できる条件 | version = 1、既知の kind、予約 flags = 0、既知の role、伸長成功（flags bit0 のとき body_len > 0 かつ伸長後 ≤ 4,096）、body の形式（フィールド長・UTF-8。tombstone / ack は supersedes 必須で body 空） | **不透明メッセージ**として扱う |
+
+- 不透明メッセージ: 生バイトのまま保存し、目録（INVENTORY）に載せ、中継する。表示も伸長もしない。hop は offset 23、expires_at は offset 19 を直接書き換える。期限・削除順はヘッダだけで判定する。端末内 **300 件かつ保存上限の 10%** まで（超えたら受信の古い順に捨てる）、1 セッション **16 KB** まで、HELLO caps bit0（未知版中継可）を立てた相手にだけ送る。（v2: C13）
+- 旧版（v1）の端末は不透明メッセージを捨てる。旧版が中継できるのは version=1・既知 kind・予約 flags=0 の封筒だけなので、v2 の拡張（help / ack・group_info の ext・notice の 5 番目）はこの範囲に収めている。（v2: C13）
+
+### 2.2 category
+
+enum は末尾追加のみ。順序変更・削除は禁止（ワイヤ上のコードが宣言順）。通知の重要度は役割による格上げ前の種別固有の値（docs/03 §4）。（v2: C15, C05）
+
+| code | 名前 | 既定 TTL | 通知の重要度（v2: C05） |
+|---|---|---|---|
+| 0 | お知らせ | 3 日 | normal |
+| 1 | 避難情報 | 3 日 | urgent |
+| 2 | 避難所（開設・閉鎖） | 7 日 | important |
+| 3 | 物資 | 12 時間 | important |
+| 4 | 給水 | 12 時間 | important |
+| 5 | 炊き出し・食事 | 12 時間 | important |
+| 6 | 医療・救護 | 1 日 | important |
+| 7 | 安否・名簿の 案内（v2: C11） | 3 日（v2: C02） | normal |
+| 8 | 交通・道路 | 1 日 | normal |
+| 9 | ライフライン（電気・水道・ガス） | 3 日（v2: C02） | normal |
+| 10 | 注意喚起 | 1 日 | urgent |
+| 11 | トイレ・入浴・洗濯（v2: C15） | 1 日 | normal |
+| 12 | 店舗・燃料・銀行（v2: C15） | 1 日 | normal |
+| 13 | 行政手続き | 7 日 | normal |
+| 14 | 支援要請 | 3 日（v2: C02） | normal |
+| 15 | 被害情報 | 3 日 | normal |
+
+### 2.3 有効期限（相対期限）（v2: C12）
+
+- 受信側は expires_at を自分の時計と比べない。**local_expiry = 受信時刻 + (expires_at − created_at)** を正とする（自端末発信は expires_at そのまま）。「created_at が未来なら破棄」も入れない（進んだ時計も同じ頻度で起きる）。
+- 受信時に破棄するのは、有効期間 (expires_at − created_at) が 0 以下、または上限を超えるときだけ: notice / help は 30 日超、tombstone / ack は 31 日超（対象の 30 日 + 猶予 24 時間）、group_info と不透明メッセージは 366 日超。
+- 中継時は **expires_at := created_at + (local_expiry − now)** に書き換えて送る（msg_id は expires_at を含まないので合法）。残り時間は縮む一方なので「中継ごとに延びる」は起きず、総寿命は元の有効期間を超えない。v1 端末は短くなった絶対 expires_at を見るだけなので相互運用する。
+- hop: 発信時 0。受信側は保存時に +1（255 で頭打ち）。64 以上は保存も中継もしない。
+
+## 3. リンク上のフレーム
+
+リンク（1 本の GATT 接続）は**双方向のバイトストリーム**として扱う。central → peripheral は RX への Write Without Response、peripheral → central は TX の Notify。1 回の書き込み/通知は `maxChunk` バイト以下（ATT MTU − 3）。フレームはチャンク境界と無関係に連結される。
+
+```
+frame = u16 length (type + payload の長さ) ‖ u8 type ‖ payload
+```
+
+| type | 名前 | payload |
+|---|---|---|
+| 0x01 | HELLO | version(1) ‖ node_id(8) ‖ store_count(u16) ‖ caps(1) ‖ [count(u8) ‖ group_id(uint24) × count]（末尾は caps bit2 のときだけ。最大 8 件。受信側は読めない余分を無視する）（v2: C13, C17） |
+| 0x02 | INVENTORY | count(u16) ‖ msg_id × count（8 バイトずつ）。複数回送ってよい（1 フレーム 1,023 件まで） |
+| 0x03 | INVENTORY_END | なし |
+| 0x04 | TIME | u32 現在エポック秒。HELLO 直後に送る。受信側は「相手の時計 − 自分の時計」を記録する（v2: C12） |
+| 0x05 | INVENTORY_CUTOFF | u32 目録に含めた中で最古の created_at。目録を絞ったときだけ INVENTORY_END の直前に送る。受信側はそれより古い notice / help を送らない（v2: C08） |
+| 0x10 | MESSAGE | 封筒 1 件（§2 のバイト列そのまま） |
+| 0x11 | MESSAGES_END | なし（この方向の送信完了） |
+| 0x20 | BYE | なし |
+
+不明な type は payload を読み飛ばす（状態判定より前に捨てるので、HELLO より前に届いても切らない）。length が 8,192 を超える、または 0 のフレームは不正としてリンクを切る。
+
+### HELLO の caps（v2: C13）
+
+| bit | 意味 | 立てる端末 |
+|---|---|---|
+| bit0 | 未知の version / kind / flags の封筒（不透明メッセージ）を中継できる | 全端末（C13） |
+| bit1 | 中継役（設定「中継役として 使う」オン） | 中継役（C04, C17） |
+| bit2 | HELLO 末尾に参加グループ一覧あり | 中継役だけ（私物端末は所属グループを露出しない）（C17） |
+| bit3 | HELLO 直後の先出し（PUSH）を受けられる | 全端末（C08） |
+| bit4〜7 | 予約（0） | — |
+
+- HELLO の version は当面 1 のまま送る。受信側は不一致でもログに残すだけで切らない。（v2: C13）
+
+## 4. 同期セッション
+
+リンクが開いたら両側が対称に以下を行う（central/peripheral の区別なし）。
+
+1. HELLO を送り、続けて TIME を送る。（v2: C12）
+2. **先出し**（docs/08 の「手順 1.5」。相手の HELLO を受けた時点で、手順 3 の目録送信と並行して行う）: 相手の HELLO を受け取り caps bit3 が立っていれば、相手の INVENTORY_END を待たずに、参加グループの最新 group_info → 参加グループの tombstone（受信から 24 時間以内）→ 参加グループの公式（role=2）notice（24 時間以内。取り消し・置き換え済みを除く）の順、各 created_at の新しい順で、合計 **16 件・8 KB** まで MESSAGE で先に送る。先出し分はセッション上限（手順 4）に含め、後段の送信から除外する。受信側は msg_id 既知なら無視する。**MESSAGE は相手の INVENTORY 受信中にも届いてよい**（MESSAGES_END の後だけ不正）。（v2: C08）
+3. 自分が持つ有効な（期限内・hop<64）メッセージの msg_id を新しい順に最大 **3,000 件**、INVENTORY で送り、INVENTORY_END を送る。空殻（§5）も載せる。`maxChunk` が **100 バイト未満**のときは目録を受信時刻の新しい順 **300 件**に絞り、INVENTORY_END の直前に INVENTORY_CUTOFF（含めた中で最古の created_at）を送る。相手はそれより古い notice / help を送らない。（v2: C08）
+4. 相手の INVENTORY_END を受け取ったら、「自分にあって相手にない」msg_id を優先順に並べ、MESSAGE で送る。優先順は **kind（group_info → tombstone → ack → notice / help）→ 相手の参加グループに属するもの（相手が HELLO に一覧を載せたときだけ）→ role 降順 → created_at 降順**。送信バイト合計が **セッション上限（既定 65,536 バイト）** に達したら打ち切る。不透明メッセージは相手が caps bit0 のときだけ、1 セッション 16 KB まで（超えた分は飛ばして次へ）。送るときは expires_at を残り時間に書き換える（§2.3）。最後に MESSAGES_END。（v2: C17, C13, C12）
+5. 受信した MESSAGE は即座に検証・保存する（hop+1、受信時刻記録）。重複（msg_id 既知）は無視。中継できない封筒は捨ててセッションは続ける。
+6. 自分が MESSAGES_END を送り終え、かつ相手の MESSAGES_END を受け取ったら、**接続を開始した側（central）** が BYE を送ってリンクを閉じる。peripheral 側は BYE 受信またはリンク切断で終了。
+7. タイムアウト: HELLO 待ち 5 秒、全体 30 秒。超過したらリンクを閉じる。
+
+### 中継役どうしの交換（v2: C17）
+- 両方の HELLO で caps bit1 が立っていれば、転送開始前にセッション上限を **1 MB**（`maxChunk` が 180 バイト未満なら **256 KB**）、全体タイムアウトを **300 秒**に差し替える。片方だけ・どちらも立っていなければ通常のまま（中間段は置かない）。
+- 先出し（手順 2）の 16 件・8 KB は中継役どうしでも同じ。
+
+### セッションの重複と再接続抑制
+- HELLO の node_id が既に進行中のセッションと同じなら、ノード ID が小さい側が開始したリンクを残し、もう一方に BYE を送って閉じる。自分自身の node_id なら閉じて 15 分無視する。
+- 同じ node_id との再接続は **60 秒** 空ける。ただし自端末の保存内容が変わった（新規投稿・新規受信）ときは待たずに再接続してよい。中継役どうし（自分が中継役で、前回の同期で相手も中継役だった）は **10 秒**。（v2: C17）
+- 接続失敗した peerId は 30 秒バックオフ。Apple 製造者データ由来の候補でサービスが見つからなかった peerId は 15 分無視する。
+- 同時接続: central として最大 2（中継役は 3）、peripheral として最大 4。（v2: C04）
+
+## 5. 保存と中継の方針
+- 保存上限 3,000 件。満杯になったら **10%（300 件）をまとめて削除**する。削除順は **期限切れ → 不透明メッセージ → 未参加グループ（住民 → スタッフ → 公式、各受信の古い順）→ 参加グループ（同順）→ 自端末発信**。（v2: C08, C13, C17）
+- 不透明メッセージは別枠で 300 件かつ保存上限の 10% まで。超えたら受信の最も古い不透明メッセージを 1 件捨ててから保存する。（v2: C13）
+- 1 グループあたり住民（role=0）の notice は端末内 **500 件**まで。超えたら受信の最も古いものを 1 件捨ててから保存する（自端末発信は数えない。住民投稿は届かない・消えることがある）。（v2: C08）
+- 参加していないグループのメッセージも保存・中継する（表示しない）。
+- tombstone は対象より長く（対象の local_expiry + 24 時間）保持する。supersedes 付き notice も同じく対象の local_expiry + 24 時間まで保持し、自身の期限後は表示しないが目録・中継には使う（先に消えた端末で旧版が復活するのを防ぐ）。保持期限は対象を見たときに決まり、対象が先に消えても有効。（v2: C01）
+- **tombstone / supersedes の適用は、同じ group_id で、封筒の role が対象の role 以上のときだけ**（住民は公式を消せない）。supersedes は対象が notice のときだけ適用し、複数あれば created_at が最新のものを「置き換え済み」の先とする。ack は置き換えにしない。適用されないものも保存・中継はする。（v2: C10, C21）
+- 取り消された**他人の** notice は本文（sender_name・title・place・text）を端末から消し、ヘッダ（msg_id・group_id・kind・flags・category・role・created_at・expires_at・hop・supersedes）だけの**空殻**にする。空殻は目録には載せる（再受信を防ぐ）が MESSAGE では送らない。発信者本人の端末と、そのグループの公式端末（ホスト・本部コードで昇格）では本文を残す（再投稿で復旧できるように）。公式（role=2）の tombstone が住民・スタッフの投稿を取り消したときは「公式による取り消し」として記録する。（v2: C20, C10）
+- group_info は同じ group_id の中で **世代（generation）→ created_at** の順で新しいものを採用する（時計のずれで古い方が勝つのを防ぐ）。（v2: C24）
+- 未参加グループの group_info は「近くで 流れている グループ」用に、最後に受け取った時刻の新しい順に最大 3 件を列挙できる。（v2: C22）
+
+## 6. v2 の変更一覧
+
+| ID | 内容 | 節 |
+|---|---|---|
+| C01 | supersedes 付き notice（書きなおす・終わりました）を対象の local_expiry + 24 時間まで保持 | §5 |
+| C02 | 既定 TTL: 安否 3 日、ライフライン 3 日、支援要請 3 日。有効期間の上限 30 日 | §2.2, §2.3 |
+| C04 | 中継役は HELLO caps bit1、central 同時 3 | §3, §4 |
+| C05 | 種別ごとの通知の重要度（表示側の規則は docs/03 §4） | §2.2 |
+| C08 | 先出し（16 件・8 KB）、目録上限 3,000、小さい maxChunk で 300 件 + INVENTORY_CUTOFF、削除順に役割、住民 notice 500 件/グループ、満杯時 10% まとめ削除 | §3, §4, §5 |
+| C10 | tombstone / supersedes は role が対象以上のときだけ適用。公式による取り消しの記録 | §5 |
+| C11 / C15 | 種別名の改名（安否・名簿の 案内、トイレ・入浴・洗濯、店舗・燃料・銀行） | §2.2 |
+| C12 | TIME フレーム。相対期限（local_expiry）、中継時の expires_at 書き換え、有効期間の上限で破棄 | §2.3, §3 |
+| C13 | ヘッダ 28 B の不変、検証の 2 段化、不透明メッセージ、HELLO caps bit0、version 不一致で切らない、body 末尾の余りを無視 | §2, §2.1, §3 |
+| C17 | HELLO 末尾の参加グループ一覧（caps bit2）、中継役どうしの上限 1 MB / 256 KB・300 秒・再接続 10 秒、相手の参加グループを先に送る | §3, §4 |
+| C20 | 取り消された他人の notice を空殻にし、目録に載せるが MESSAGE では送らない | §5 |
+| C21 | kind 3=help / 4=ack、policy bit2 | §2 |
+| C22 | 未参加グループの group_info の列挙 | §5 |
+| C23 | 訓練は見出しの「【訓練】」。flags bit2〜7 は予約のまま | §2 |
+| C24 | group_info の ext（code_digest・generation・successor）、policy bit1 = 閉鎖、世代 → created_at で採用 | §2, §5 |
+| C25 | notice body の 5 番目以降を無視（将来の定型見出し） | §2 |
+| — | msg_id に supersedes を含める（受信側は再計算しないので互換） | §2 |
+
+## 7. 割り当て表（docs/08 §3.2 より転記。以後の拡張はこの表に従う）（v2: C13）
+
+| 欄 | 値 | 意味 | 変更 |
+|---|---|---|---|
+| HELLO caps bit0 | 1 | 未知の version/kind/flags の封筒を中継できる | C13 |
+| HELLO caps bit1 | 1 | 中継役（設定「中継役として 使う」オン） | C04 C17 |
+| HELLO caps bit2 | 1 | HELLO 末尾に参加グループ一覧あり（中継役だけが立てる） | C17 |
+| HELLO caps bit3 | 1 | HELLO 直後の先出し（PUSH）を受けられる | C08 |
+| HELLO caps bit4〜7 | 0 | 予約 | — |
+| HELLO version | 1 | 当面 1 のまま送る。不一致でも切らず min(version) で続ける | C13 |
+| 封筒 flags bit0 / bit1 | — | 圧縮 / supersedes あり（現行） | — |
+| 封筒 flags bit2〜7 | 0 | 予約（訓練は見出し【訓練】、定型見出しは body の 5 番目フィールドで表すため flags は使わない） | C23 C25 |
+| 封筒 kind | 3 / 4 | help（困りごと）/ ack（受け取りました） | C21 |
+| group_info policy bit1 / bit2 | 1 | 閉鎖（closed）/ 困りごとを受け付ける | C24 C21 |
+| group_info body 5 番目 | ext | u16 len ‖ code_digest 8 B ‖ generation u16 ‖ successor uint24 | C24 |
+| notice body 5 番目 | 定型 | template_id u8 ‖ 穴埋め値（u16 len + UTF-8 の列）。省略可 | C25 |
+| フレーム 0x04 | TIME | u32 現在エポック秒。HELLO 直後に送る | C12 |
+| フレーム 0x05 | INVENTORY_CUTOFF | u32 目録最古の created_at。INVENTORY_END の直前 | C08 |
+
+## 改訂履歴
+
+| 版 | 日付 | 内容 |
+|---|---|---|
+| v1 | 2026-10-11 | 初版 |
+| v2 | 2026-10-21 | [08_use_cases.md](08_use_cases.md) の仕様変更を実装に合わせて反映。§2 kind 3/4・msg_id・group_info ext・policy、§2.1 検証の 2 段化と不透明メッセージ、§2.2 種別名と TTL、§2.3 相対期限、§3 TIME / INVENTORY_CUTOFF / caps、§4 先出し・目録・中継役、§5 削除順・空殻・role 規則・世代、§6・§7 新設 |
