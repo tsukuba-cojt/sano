@@ -272,6 +272,28 @@ void main() {
     );
     expect(b.myReports(inReplyTo: request.msgId).length, 1);
     expect(b.myReports(inReplyTo: other.msgId), isEmpty);
+    // 同じ安否確認への同じ返事は 30 分止めるが、別の安否確認への返事は送れる。
+    await expectLater(
+      () => b.sendReport(
+        groupCode: g.code,
+        type: ReportType.safe,
+        inReplyTo: request.msgId,
+      ),
+      throwsA(isA<ReportTooSoonException>()),
+    );
+    final request2 = await hq.postNotice(
+      groupCode: g.code,
+      category: NoticeCategory.safety,
+      title: '〇〇地区の 安否確認です',
+      asksReply: true,
+    );
+    await meet('B', 'HQ');
+    await b.sendReport(
+      groupCode: g.code,
+      type: ReportType.safe,
+      inReplyTo: request2.msgId,
+    );
+    expect(b.myReports(inReplyTo: request2.msgId).length, 1);
 
     await meet('B', 'C');
     await meet('HQ', 'B');
@@ -286,7 +308,7 @@ void main() {
       hq.receivedReports(inReplyTo: request.msgId).every((e) => e.acked),
       isTrue,
     );
-    final text = hq.reportsAsText(hq.receivedReports());
+    final text = hq.reportsAsText(hq.receivedReports(inReplyTo: request.msgId));
     expect(text.split('\n').length, 2);
     expect(text, contains('受け取り済み'));
 

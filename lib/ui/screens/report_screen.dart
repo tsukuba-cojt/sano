@@ -84,11 +84,8 @@ class _ReportScreenState extends State<ReportScreen> {
     } else if (_groups.isNotEmpty) {
       _groupCode = _groups.first.code;
     }
+    // 名前は平文で中継されるので、設定の表示名を自動では入れない（C21）。
     _type = widget.initialType;
-    final name = _c.settings.displayName.trim();
-    if (name.isNotEmpty) {
-      _nameCtl.text = name;
-    }
   }
 
   @override

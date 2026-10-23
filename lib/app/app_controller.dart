@@ -1731,7 +1731,8 @@ class AppController extends ChangeNotifier {
         continue;
       }
       final e = reportEntryOf(m);
-      if (e == null || e.info.type != type) {
+      // 同じ種類・同じ返事先（別の安否確認への返事は別に数える）だけを止める。
+      if (e == null || e.info.type != type || e.info.inReplyTo != inReplyTo) {
         continue;
       }
       if (createdAt - m.envelope.createdAt < type.resendInterval.inSeconds) {
