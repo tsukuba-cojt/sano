@@ -223,13 +223,21 @@ class _FieldReader {
   }
 }
 
+/// notice / help body の 5 番目のフィールド（拡張）の上限。
+const int kMaxNoticeExtBytes = 64;
+
 /// お知らせ（kind=notice / help）の body。
+///
+/// 4 フィールド（sender_name / title / place / text）に加え、5 番目に省略可能な
+/// 拡張 [ext] を持つ（notice は「返事を 求める」印、help は知らせの種類・人数など。
+/// 中身は core/report.dart が読む）。旧版は 5 番目以降を無視するので互換がある。
 class NoticeBody {
   const NoticeBody({
     required this.senderName,
     required this.title,
     this.place = '',
     this.text = '',
+    this.ext,
   });
 
   /// 発信元表示名（≤ 48 バイト）。
@@ -244,18 +252,26 @@ class NoticeBody {
   /// 本文（≤ 3,000 バイト）。
   final String text;
 
-  /// `u16 len + UTF-8` × 4 に直列化する。長さ超過は [EnvelopeFormatException]。
+  /// 拡張（≤ 64 バイト）。null なら 4 フィールドだけで直列化する。
+  final Uint8List? ext;
+
+  /// `u16 len + UTF-8` × 4（＋ ext）に直列化する。長さ超過は [EnvelopeFormatException]。
   Uint8List encode() {
     final w = _FieldWriter()
       ..addString(senderName, maxBytes: kMaxSenderNameBytes, name: 'sender_name')
       ..addString(title, maxBytes: kMaxTitleBytes, name: 'title')
       ..addString(place, maxBytes: kMaxPlaceBytes, name: 'place')
       ..addString(text, maxBytes: kMaxTextBytes, name: 'text');
+    final extBytes = ext;
+    if (extBytes != null) {
+      w.addBytes(extBytes, maxBytes: kMaxNoticeExtBytes, name: 'ext');
+    }
     return w.takeBytes();
   }
 
-  /// 直列化された body を復元する。長さ超過・不正は [EnvelopeFormatException]。
-  /// 5 番目以降のフィールド（将来の定型見出しなど）は無視する。
+  /// 直列化された body を復元する。4 フィールドの長さ超過・不正は
+  /// [EnvelopeFormatException]。5 番目（ext）は読めなければ無視し、
+  /// 6 番目以降も無視する（C13）。
   static NoticeBody decode(Uint8List bytes) {
     final r = _FieldReader(bytes);
     final senderName =
@@ -263,18 +279,28 @@ class NoticeBody {
     final title = r.readString(maxBytes: kMaxTitleBytes, name: 'title');
     final place = r.readString(maxBytes: kMaxPlaceBytes, name: 'place');
     final text = r.readString(maxBytes: kMaxTextBytes, name: 'text');
+    Uint8List? ext;
+    if (r.hasMore) {
+      try {
+        ext = Uint8List.fromList(
+            r.readBytes(maxBytes: kMaxNoticeExtBytes, name: 'ext'));
+      } on EnvelopeFormatException {
+        ext = null;
+      }
+    }
     return NoticeBody(
       senderName: senderName,
       title: title,
       place: place,
       text: text,
+      ext: ext,
     );
   }
 
   @override
   String toString() =>
       'NoticeBody(senderName: $senderName, title: $title, place: $place, '
-      'text: ${text.length} 文字)';
+      'text: ${text.length} 文字${ext != null ? ', ext: ${ext!.length} バイト' : ''})';
 }
 
 /// グループ情報（kind=group_info）の body。

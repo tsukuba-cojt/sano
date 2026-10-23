@@ -6,6 +6,7 @@ import 'package:kairanban/app/app_controller.dart';
 import 'package:kairanban/core/categories.dart';
 import 'package:kairanban/core/envelope.dart';
 import 'package:kairanban/core/epoch.dart';
+import 'package:kairanban/core/report.dart';
 import 'package:kairanban/mesh/message_store.dart';
 
 import '../../app/theme.dart';
@@ -208,6 +209,7 @@ class _NoticeDetailScreenState extends State<NoticeDetailScreen> {
           final previous = env.supersedes != null ? _c.store.get(env.supersedes!) : null;
           final previousNotice = previous?.envelope.notice;
           final group = _c.groups.byCode(m.groupId);
+          final asks = body != null && AppController.asksReply(m);
 
           final buttons = <Widget>[];
           if (body != null) {
@@ -296,6 +298,7 @@ class _NoticeDetailScreenState extends State<NoticeDetailScreen> {
                         CategoryTag(env.category.label),
                         RoleBadge(env.role),
                         if (m.isLocal) const StateTag('自分の 投稿'),
+                        if (asks) const CautionTag('返事を ください'),
                         if (env.supersedes != null)
                           StateTag(looksLikeEndTitle(title) ? '終わりました' : '書きなおし'),
                       ],
@@ -335,6 +338,10 @@ class _NoticeDetailScreenState extends State<NoticeDetailScreen> {
                 CardBox(child: SelectableText(text, style: KairanTextStyles.body))
               else
                 const Text('（本文は ありません）', style: KairanTextStyles.metaSecondary),
+              if (asks) ...[
+                const SizedBox(height: 16),
+                _ReplyPanel(controller: _c, request: m, active: active),
+              ],
               const SizedBox(height: 16),
               const Divider(),
               const SizedBox(height: 12),
@@ -368,6 +375,104 @@ class _NoticeDetailScreenState extends State<NoticeDetailScreen> {
           );
         },
       ),
+    );
+  }
+}
+
+/// 安否確認（返事を 求める お知らせ）の返事の欄。
+///
+/// 本部・スタッフ・出した本人には返事の集計と「返事を 見る」、それ以外には
+/// 「無事です」「家に います」「困っています」「助けて」のボタンと、送った返事の状態を出す。
+class _ReplyPanel extends StatelessWidget {
+  const _ReplyPanel({
+    required this.controller,
+    required this.request,
+    required this.active,
+  });
+
+  final AppController controller;
+  final StoredMessage request;
+
+  /// 取り消し・置き換えされていない（返事を受け付ける）か。
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = controller;
+    final now = dateTimeFromEpoch(c.now);
+    if (c.canSeeReports(request.groupId) || request.isLocal) {
+      final replies = c.receivedReports(
+        groupCode: request.groupId,
+        inReplyTo: request.msgId,
+      );
+      final summary = AppController.summarize(replies);
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          InfoBox(
+            '${summary.line()}${summary.unacked > 0 ? '\nまだ 返事を していない: ${formatCountJa(summary.unacked, '件')}' : ''}',
+            title: '返事 ${formatCountJa(summary.total, '件')}',
+            kind: summary.unackedSos > 0 ? InfoKind.danger : InfoKind.plain,
+          ),
+          const SizedBox(height: KairanSizes.gap),
+          SecondaryButton(
+            label: '返事を 見る',
+            onPressed: () => openReportsScreen(
+              context,
+              c,
+              groupCode: request.groupId,
+              inReplyTo: request.msgId,
+            ),
+          ),
+        ],
+      );
+    }
+    final mine = c.myReports(inReplyTo: request.msgId);
+    final children = <Widget>[];
+    if (active && c.canReportTo(request.groupId, inReplyTo: request.msgId)) {
+      void open(ReportType type) => openReportScreen(
+            context,
+            c,
+            type: type,
+            inReplyTo: request.msgId,
+            groupCode: request.groupId,
+          );
+      children.addAll([
+        const InfoBox(
+          'この お知らせは 返事を 求めて います。当てはまる ボタンを 押してください。',
+          title: '返事を してください',
+          kind: InfoKind.caution,
+        ),
+        const SizedBox(height: KairanSizes.gap),
+        PrimaryButton(label: ReportType.safe.label, onPressed: () => open(ReportType.safe)),
+        const SizedBox(height: KairanSizes.gap),
+        SecondaryButton(label: ReportType.home.label, onPressed: () => open(ReportType.home)),
+        const SizedBox(height: KairanSizes.gap),
+        SecondaryButton(label: ReportType.need.label, onPressed: () => open(ReportType.need)),
+        const SizedBox(height: KairanSizes.gap),
+        SecondaryButton(
+          label: ReportType.sos.label,
+          danger: true,
+          onPressed: () => open(ReportType.sos),
+        ),
+      ]);
+    }
+    for (final e in mine) {
+      final sent = formatDayTimeJa(dateTimeFromEpoch(e.message.envelope.createdAt), now: now);
+      final ack = e.ack;
+      children.addAll([
+        const SizedBox(height: KairanSizes.gap),
+        InfoBox(
+          ack == null
+              ? '「${e.info.type.label}」を 送りました（$sent）。まだ 受け取りの 返事は ありません。'
+              : '「${e.info.type.label}」を 送りました（$sent）。${c.ackSenderLabel(ack)}が 受け取りました（${formatDayTimeJa(dateTimeFromEpoch(ack.envelope.createdAt), now: now)}）。',
+          kind: ack == null ? InfoKind.plain : InfoKind.success,
+        ),
+      ]);
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: children,
     );
   }
 }

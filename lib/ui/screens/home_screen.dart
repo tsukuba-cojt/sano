@@ -10,6 +10,7 @@ import 'package:kairanban/app/app_controller.dart';
 import 'package:kairanban/core/categories.dart';
 import 'package:kairanban/core/envelope.dart';
 import 'package:kairanban/core/epoch.dart';
+import 'package:kairanban/core/report.dart';
 import 'package:kairanban/mesh/message_store.dart';
 
 import '../../app/theme.dart';
@@ -151,6 +152,20 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  int _sosSeen = 0;
+
+  /// 返事をしていない SOS が増えたら 3 回振動する（本部・スタッフの端末）。
+  void _triggerSosHaptics(int count) {
+    if (count > _sosSeen) {
+      for (var i = 0; i < 3; i++) {
+        Timer(Duration(milliseconds: 300 * i), () {
+          HapticFeedback.heavyImpact();
+        });
+      }
+    }
+    _sosSeen = count;
+  }
+
   Future<void> _openUrgent() async {
     final ids = _c.foregroundUrgentIds;
     if (ids.isEmpty) {
@@ -271,6 +286,11 @@ class _HomeScreenState extends State<HomeScreen> {
               : _c.store.unreadCount(now: _c.now, groupIds: {groupCode});
           final training = _c.unreadTrainingCount;
           final canPost = groups.any((g) => g.canPost);
+          final canReport = _c.reportGroups.isNotEmpty;
+          final seesReports = _c.seesAnyReports;
+          final reports = seesReports ? _c.receivedReports() : const <ReportEntry>[];
+          final reportSummary = AppController.summarize(reports);
+          _triggerSosHaptics(reportSummary.unackedSos);
 
           return Column(
             children: [
@@ -279,6 +299,11 @@ class _HomeScreenState extends State<HomeScreen> {
                 _UrgentBand(
                   count: urgentIds.length,
                   onTap: _openUrgent,
+                ),
+              if (seesReports)
+                _ReportsBand(
+                  summary: reportSummary,
+                  onTap: () => openReportsScreen(context, _c),
                 ),
               if (groups.length > 1)
                 Padding(
@@ -370,7 +395,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ),
               ),
-              if (canPost)
+              if (canPost || canReport)
                 SafeArea(
                   top: false,
                   child: Padding(
@@ -380,10 +405,25 @@ class _HomeScreenState extends State<HomeScreen> {
                       KairanSizes.pagePadding,
                       12,
                     ),
-                    child: PrimaryButton(
-                      label: 'お知らせを 書く',
-                      icon: Icons.edit_outlined,
-                      onPressed: () => openComposeScreen(context, _c),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        if (canPost)
+                          PrimaryButton(
+                            label: 'お知らせを 書く',
+                            icon: Icons.edit_outlined,
+                            onPressed: () => openComposeScreen(context, _c),
+                          ),
+                        if (canPost && canReport)
+                          const SizedBox(height: KairanSizes.gap),
+                        if (canReport)
+                          SecondaryButton(
+                            label: '本部に 知らせる（SOS・安否）',
+                            icon: Icons.campaign_outlined,
+                            onPressed: () => openReportScreen(context, _c),
+                          ),
+                      ],
                     ),
                   ),
                 ),
@@ -423,6 +463,54 @@ class _UrgentBand extends StatelessWidget {
               child: Text(
                 label,
                 style: KairanTextStyles.sectionTitle.copyWith(color: KairanColors.card),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 本部・スタッフの端末の「住民からの 知らせ」帯。返事をしていない SOS があれば赤地。
+class _ReportsBand extends StatelessWidget {
+  const _ReportsBand({required this.summary, required this.onTap});
+
+  final ReportSummary summary;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final sos = summary.unackedSos > 0;
+    final String label;
+    if (sos) {
+      label = 'SOS が ${summary.unackedSos}件 あります（まだ 返事を していません） ▶ 見る';
+    } else if (summary.total == 0) {
+      label = '住民からの 知らせ: まだ ありません ▶ 見る';
+    } else {
+      label = '住民からの 知らせ: ${summary.line()}'
+          '${summary.unacked > 0 ? '（未返事 ${summary.unacked}件）' : ''} ▶ 見る';
+    }
+    final fg = sos ? KairanColors.card : KairanColors.text;
+    return Semantics(
+      button: true,
+      label: label,
+      onTap: onTap,
+      child: ExcludeSemantics(
+        child: Material(
+          color: sos ? KairanColors.danger : KairanColors.selectedFill,
+          child: InkWell(
+            onTap: onTap,
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(
+                horizontal: KairanSizes.pagePadding,
+                vertical: 10,
+              ),
+              child: Text(
+                label,
+                style: (sos ? KairanTextStyles.sectionTitle : KairanTextStyles.meta)
+                    .copyWith(color: fg),
               ),
             ),
           ),
@@ -514,6 +602,7 @@ class _NoticeList extends StatelessWidget {
                 : null,
             endingSoon: !ended && localExpiry - now <= 3600,
             clockSuspicious: clockSuspicious,
+            asksReply: AppController.asksReply(m),
             onTap: () => onTap(m.msgId),
           ),
         ),

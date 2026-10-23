@@ -50,9 +50,15 @@ offset size  field
   2. title（見出し、≤ 120 バイト）
   3. place（場所、≤ 120 バイト）
   4. text（本文、≤ 3,000 バイト）
-  5 番目以降のフィールドは無視する（将来の定型見出し用。旧版・新版の相互運用のため末尾の余りを拒否しない）。（v2: C13, C25）
-- `kind=help` の body は notice と同形式。見出しに 6 択と場所・人数（例「【〇〇町2丁目】薬・医療が 必要（2〜3人）」）、sender_name・text は空。category=14 支援要請、role=0、有効期間 24 時間。表示するのはそのグループの公式・スタッフ端末だけで、住民端末は保存・中継のみ（表示上の分離であり秘匿ではない）。（v2: C21）
-- `kind=ack` の body は空。supersedes 必須（対象の help の msg_id）。「置き換え」扱いにはしない（対象は表示されたままで、詳細に「受け取りました」を示す）。（v2: C21）
+  5. ext（省略可、≤ 64 バイト）: `flags u8`。bit0 = **返事を 求める（安否確認）**。立っていると受信側の詳細に「無事です」「家に います」「困っています」「助けて」の返事ボタンを出す。公式・スタッフ（role ≥ 1）の notice だけに付ける。書きなおしは元の印を引き継ぐ。（v2.1: C21 拡張）
+  5 番目が壊れていれば ext なしとして読み、6 番目以降のフィールドは無視する（旧版・新版の相互運用のため末尾の余りを拒否しない）。（v2: C13, C25）
+- `kind=help`（住民からの知らせ）の body は notice と同形式で、5 番目の ext に種類などを載せる（`lib/core/report.dart`）。（v2: C21、v2.1 で SOS・安否・在宅避難に拡張）
+  - ext: `type u8 ‖ people u8 ‖ needs u8 ‖ flags u8 ‖ in_reply_to i64 LE（省略可）`。type: 0 = SOS（助けて）、1 = 無事です、2 = 家に います（在宅避難）、3 = 困っています（未知の値は 3 として読む）。people: 人数（0 = 書いていない、5 = 5人以上）。needs: bit0 水・食べ物が ない、bit1 薬・医療が 必要、bit2 動けない・助けが 必要、bit3 トイレが 使えない、bit4 電気・ガスが 止まっている、bit5 その他（未知のビットは無視）。flags bit0 = けがを している 人が いる。in_reply_to: 返事先の安否確認 notice の msg_id（0 = なし）。ext が 4 バイト未満なら種類不明として見出しだけ表示、12 バイト以上なら返事先あり、余りは無視。
+  - title は端末が自動で作る（例「【SOS】助けが 必要です（2人）」「【無事】山田 花子 さんは 無事です（3人）」「【在宅避難】家に います（3人） ・ 水・食べ物が ない ほか」「【困りごと】薬・医療が 必要（2人）」）。sender_name は無事です・在宅避難のときだけ任意の名前（SOS・困りごとは空）。place は町名と目印（番地は書かせない）、text は 40 文字までのひとこと。
+  - category=14 支援要請、role は送った端末の役割（住民は 0）。有効期間: SOS 24 時間、困りごと 2 日、無事です・在宅避難 3 日。同じグループ・同じ種類は 30 分（SOS は 10 分）たつまで端末側で送り直させない。
+  - 送れるのは、グループ情報の policy bit2（住民からの 知らせを 受け付ける）が立つグループ、または返事を 求める notice への返事（in_reply_to が同じグループの期限内の安否確認）のとき。
+  - 表示するのはそのグループの公式・スタッフ端末だけで、住民端末は保存・中継のみ（表示上の分離であり秘匿ではない）。送った本人は「送った 知らせ」で状態を見て、取り消せる（tombstone。中継端末では本文を消して空殻にする）。
+- `kind=ack` の body は空。supersedes 必須（対象の help の msg_id）。公式・スタッフ端末が「受け取りました と 返す」で出す（role はその端末の役割）。有効期間は min(対象の期限 + 24 時間, 発信から 72 時間)。「置き換え」扱いにはしない（対象は表示されたままで、詳細に「〇〇市 防災課が 受け取りました（午後3時10分）」を示す）。対応の約束ではない。（v2: C21）
 - `kind=group_info` の body（平文）: 同形式で 1. name（グループ名 ≤ 60 B）2. host_name（≤ 48 B）3. policy（1 バイト: bit0 = 参加者も投稿可、bit1 = 閉鎖（引っ越し済み）、bit2 = 困りごとを受け付ける）4. description（問い合わせ先・ひとこと ≤ 300 B）5. ext（省略可）: `u16 len ‖ code_digest 8 B ‖ generation u16 ‖ successor uint24`。code_digest = SHA-256(本部コード 8 桁 ASCII) 先頭 4 B ‖ SHA-256(スタッフコード 8 桁 ASCII) 先頭 4 B（全 0 は「なし」）。generation はコードの作り直し・引っ越しごとに +1。successor は後継の参加コード（0 = なし。999999 超は 0 扱い）。ext が 13 バイト未満なら ext なしとして読み、6 番目以降のフィールドは無視する。group_info は role=2 で発信され、expires_at は作成から 365 日。（v2: C24, C21）
 - `kind=tombstone` の body は空。supersedes 必須。受信側は対象 msg_id を「取り消し済み」として表示から外し、他人の notice は本文を消して空殻にする（§5）。（v2: C20）
 - 圧縮: `flags bit0` が立つ場合、body は **raw deflate（zlib ヘッダなし、windowBits=-15）+ 事前共有辞書**（`lib/core/dictionary.dart` の `kDictionaryV1`、UTF-8 バイト列）。伸長後サイズは **4,096 バイト上限**（超過は破棄）。圧縮しても縮まない場合は圧縮しない。
@@ -135,9 +141,9 @@ frame = u16 length (type + payload の長さ) ‖ u8 type ‖ payload
 リンクが開いたら両側が対称に以下を行う（central/peripheral の区別なし）。
 
 1. HELLO を送り、続けて TIME を送る。（v2: C12）
-2. **先出し**（docs/08 の「手順 1.5」。相手の HELLO を受けた時点で、手順 3 の目録送信と並行して行う）: 相手の HELLO を受け取り caps bit3 が立っていれば、相手の INVENTORY_END を待たずに、参加グループの最新 group_info → 参加グループの tombstone（受信から 24 時間以内）→ 参加グループの公式（role=2）notice（24 時間以内。取り消し・置き換え済みを除く）の順、各 created_at の新しい順で、合計 **16 件・8 KB** まで MESSAGE で先に送る。先出し分はセッション上限（手順 4）に含め、後段の送信から除外する。受信側は msg_id 既知なら無視する。**MESSAGE は相手の INVENTORY 受信中にも届いてよい**（MESSAGES_END の後だけ不正）。（v2: C08）
+2. **先出し**（docs/08 の「手順 1.5」。相手の HELLO を受けた時点で、手順 3 の目録送信と並行して行う）: 相手の HELLO を受け取り caps bit3 が立っていれば、相手の INVENTORY_END を待たずに、参加グループの最新 group_info → 参加グループの tombstone（受信から 24 時間以内）→ 参加グループの公式（role=2）notice（24 時間以内。取り消し・置き換え済みを除く）の順、各 created_at の新しい順で、合計 **16 件・8 KB** まで MESSAGE で先に送る（v2.1: tombstone の次に、自分が出した help（24 時間以内・まだ ack が無いもの）→ 参加グループの ack（24 時間以内）を入れる）。先出し分はセッション上限（手順 4）に含め、後段の送信から除外する。受信側は msg_id 既知なら無視する。**MESSAGE は相手の INVENTORY 受信中にも届いてよい**（MESSAGES_END の後だけ不正）。（v2: C08）
 3. 自分が持つ有効な（期限内・hop<64）メッセージの msg_id を新しい順に最大 **3,000 件**、INVENTORY で送り、INVENTORY_END を送る。空殻（§5）も載せる。`maxChunk` が **100 バイト未満**のときは目録を受信時刻の新しい順 **300 件**に絞り、INVENTORY_END の直前に INVENTORY_CUTOFF（含めた中で最古の created_at）を送る。相手はそれより古い notice / help を送らない。（v2: C08）
-4. 相手の INVENTORY_END を受け取ったら、「自分にあって相手にない」msg_id を優先順に並べ、MESSAGE で送る。優先順は **kind（group_info → tombstone → ack → notice / help）→ 相手の参加グループに属するもの（相手が HELLO に一覧を載せたときだけ）→ role 降順 → created_at 降順**。送信バイト合計が **セッション上限（既定 65,536 バイト）** に達したら打ち切る。不透明メッセージは相手が caps bit0 のときだけ、1 セッション 16 KB まで（超えた分は飛ばして次へ）。送るときは expires_at を残り時間に書き換える（§2.3）。最後に MESSAGES_END。（v2: C17, C13, C12）
+4. 相手の INVENTORY_END を受け取ったら、「自分にあって相手にない」msg_id を優先順に並べ、MESSAGE で送る。優先順は **kind（group_info → tombstone → ack → help → notice。v2.1 で help を notice より前に）→ 相手の参加グループに属するもの（相手が HELLO に一覧を載せたときだけ）→ role 降順 → created_at 降順**。送信バイト合計が **セッション上限（既定 65,536 バイト）** に達したら打ち切る。不透明メッセージは相手が caps bit0 のときだけ、1 セッション 16 KB まで（超えた分は飛ばして次へ）。送るときは expires_at を残り時間に書き換える（§2.3）。最後に MESSAGES_END。（v2: C17, C13, C12）
 5. 受信した MESSAGE は即座に検証・保存する（hop+1、受信時刻記録）。重複（msg_id 既知）は無視。中継できない封筒は捨ててセッションは続ける。
 6. 自分が MESSAGES_END を送り終え、かつ相手の MESSAGES_END を受け取ったら、**接続を開始した側（central）** が BYE を送ってリンクを閉じる。peripheral 側は BYE 受信またはリンク切断で終了。
 7. タイムアウト: HELLO 待ち 5 秒、全体 30 秒。超過したらリンクを閉じる。
@@ -210,3 +216,4 @@ frame = u16 length (type + payload の長さ) ‖ u8 type ‖ payload
 |---|---|---|
 | v1 | 2026-10-11 | 初版 |
 | v2 | 2026-10-21 | [08_use_cases.md](08_use_cases.md) の仕様変更を実装に合わせて反映。§2 kind 3/4・msg_id・group_info ext・policy、§2.1 検証の 2 段化と不透明メッセージ、§2.2 種別名と TTL、§2.3 相対期限、§3 TIME / INVENTORY_CUTOFF / caps、§4 先出し・目録・中継役、§5 削除順・空殻・role 規則・世代、§6・§7 新設 |
+| v2.1 | 2026-10-23 | 住民からの知らせを SOS・無事です・在宅避難・困っています に拡張（help の ext、notice の ext「返事を 求める」、送信順と先出しで help・ack を前に） |

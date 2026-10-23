@@ -4,6 +4,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:kairanban/app/app_controller.dart';
 import 'package:kairanban/core/epoch.dart';
+import 'package:kairanban/core/report.dart';
 
 import 'screens/compose_screen.dart';
 import 'screens/create_group_screen.dart';
@@ -11,6 +12,9 @@ import 'screens/diagnostics_screen.dart';
 import 'screens/group_detail_screen.dart';
 import 'screens/join_screen.dart';
 import 'screens/notice_detail_screen.dart';
+import 'screens/report_detail_screen.dart';
+import 'screens/report_screen.dart';
+import 'screens/reports_screen.dart';
 
 Future<T?> _push<T>(BuildContext context, Widget screen) {
   return Navigator.of(context).push<T>(
@@ -99,4 +103,53 @@ Future<void> openGroupDetail(
 /// 通信の状態（診断）。
 Future<void> openDiagnostics(BuildContext context, AppController controller) {
   return _push<void>(context, DiagnosticsScreen(controller: controller));
+}
+
+/// 「本部に 知らせる」画面（SOS・無事です・在宅避難・困っています）。
+/// 安否確認の返事ボタンからは [type] と [inReplyTo] を渡す。
+Future<void> openReportScreen(
+  BuildContext context,
+  AppController controller, {
+  ReportType? type,
+  int? inReplyTo,
+  int? groupCode,
+}) {
+  return _push<void>(
+    context,
+    ReportScreen(
+      controller: controller,
+      initialType: type,
+      inReplyTo: inReplyTo,
+      groupCode: groupCode,
+    ),
+  );
+}
+
+/// 本部・スタッフの「住民からの 知らせ」一覧。
+Future<void> openReportsScreen(
+  BuildContext context,
+  AppController controller, {
+  int? groupCode,
+  int? inReplyTo,
+}) {
+  return _push<void>(
+    context,
+    ReportsScreen(
+      controller: controller,
+      groupCode: groupCode,
+      inReplyTo: inReplyTo,
+    ),
+  );
+}
+
+/// 知らせ 1 件の詳細。
+Future<void> openReportDetail(
+  BuildContext context,
+  AppController controller,
+  int msgId,
+) {
+  return _push<void>(
+    context,
+    ReportDetailScreen(controller: controller, msgId: msgId),
+  );
 }

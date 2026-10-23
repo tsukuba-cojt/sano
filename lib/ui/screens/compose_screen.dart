@@ -94,6 +94,9 @@ class _ComposeScreenState extends State<ComposeScreen> {
   /// 「時刻を 決める」で選んだ終わる時刻（エポック秒）。null なら [_ttl]。
   int? _ttlUntil;
   bool _training = false;
+
+  /// 返事の ボタン（無事です・家に います・困っています・助けて）を付ける安否確認。
+  bool _asksReply = false;
   final _placeCtl = TextEditingController();
   final _titleCtl = TextEditingController();
   final _textCtl = TextEditingController();
@@ -226,6 +229,30 @@ class _ComposeScreenState extends State<ComposeScreen> {
     });
   }
 
+  /// 安否確認の見出し（返事の ボタンを 付けたとき、見出しが空かテンプレートのままなら入れる）。
+  static const String kReplyRequestTitle = '安否確認です。下の ボタンで 返事を してください';
+
+  void _setAsksReply(bool v) {
+    setState(() {
+      _asksReply = v;
+      if (v) {
+        _category = NoticeCategory.safety;
+        _templateIndex = 0;
+        if (!_training) {
+          _ttl = const Duration(days: 3);
+          _ttlUntil = null;
+        }
+        if (!_titleEdited) {
+          _titleCtl.text = kReplyRequestTitle;
+          _titleEdited = true;
+        }
+      } else if (_titleCtl.text == kReplyRequestTitle) {
+        _titleEdited = false;
+        _applyTemplate();
+      }
+    });
+  }
+
   Future<void> _pickEndTime() async {
     final now = dateTimeFromEpoch(_c.now);
     final picked = await showDialog<DateTime>(
@@ -287,6 +314,8 @@ class _ComposeScreenState extends State<ComposeScreen> {
       message = '前の お知らせは 消えて、この 内容に 置き換わります。近くの スマホに 広がります。';
     } else if (_training) {
       message = '訓練として 送ります。見出しに【訓練】が 付きます。';
+    } else if (_asksReply) {
+      message = '返事の ボタンを 付けて 送ります。受け取った 人が 押すと、近くの スマホを 通って 返事が 届きます。届くまで 時間が かかります。';
     } else if (groups.length > 1) {
       final names = groups
           .map((g) => '${displayGroupName(g.name)}（${g.postRole.label}）')
@@ -326,6 +355,7 @@ class _ComposeScreenState extends State<ComposeScreen> {
             text: _textCtl.text.trim(),
             ttl: _effectiveTtl,
             training: _training,
+            asksReply: _asksReply && g.postRole != SenderRole.resident,
           );
         }
       }
@@ -443,6 +473,24 @@ class _ComposeScreenState extends State<ComposeScreen> {
                 onChanged: _sending ? null : _setTraining,
                 title: const Text('これは 訓練です'),
                 subtitle: const Text('見出しに【訓練】が 付き、期限は 3時間に なります。'),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Material(
+              color: KairanColors.card,
+              shape: const RoundedRectangleBorder(
+                borderRadius: BorderRadius.all(Radius.circular(KairanSizes.radius)),
+                side: BorderSide(color: KairanColors.borderDecorative),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: SwitchListTile(
+                value: _asksReply,
+                onChanged: _sending ? null : _setAsksReply,
+                title: const Text('返事の ボタンを 付ける（安否確認）'),
+                subtitle: const Text(
+                  '受け取った 人に「無事です」「家に います」「困っています」「助けて」の ボタンが 出ます。返事は 本部と スタッフの 端末に 届きます。',
+                ),
                 contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
               ),
             ),

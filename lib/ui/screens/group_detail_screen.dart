@@ -9,6 +9,7 @@ import 'package:kairanban/mesh/groups.dart';
 
 import '../../app/theme.dart';
 import '../format.dart';
+import '../routes.dart';
 import '../widgets/big_button.dart';
 import '../widgets/dialogs.dart';
 import '../widgets/group_qr.dart';
@@ -345,9 +346,10 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
                       SwitchListTile(
                         value: g.acceptsHelp,
                         onChanged: _busy ? null : _setAcceptsHelp,
-                        title: const Text('困りごとを 受け付ける'),
+                        title: const Text('住民からの 知らせを 受け付ける'),
                         subtitle: const Text(
-                          'オンにすると、住民が「困っています」を 送れます。係の人を 置いてから オンにしてください。',
+                          'オンにすると、住民が「本部に 知らせる」から SOS・無事です・在宅避難・困っています を 送れます。'
+                          '見る 係の 人を 置いてから オンにしてください。安否確認の 返事は オフでも 届きます。',
                         ),
                         contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                       ),
@@ -379,6 +381,14 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
                 SecondaryButton(
                   label: g.isStaff ? 'スタッフコードを 入れ直す' : 'スタッフコードを 入れる',
                   onPressed: _busy ? null : () => _elevate(g, hq: false),
+                ),
+              ],
+              if (g.canManage || g.isStaff) ...[
+                const SizedBox(height: 16),
+                SecondaryButton(
+                  label: '住民からの 知らせを 見る',
+                  icon: Icons.campaign_outlined,
+                  onPressed: () => openReportsScreen(context, _c, groupCode: g.code),
                 ),
               ],
               if (g.postRole.index > 0) ...[

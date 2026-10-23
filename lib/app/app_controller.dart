@@ -12,6 +12,7 @@ import '../core/categories.dart';
 import '../core/envelope.dart';
 import '../core/epoch.dart';
 import '../core/ids.dart';
+import '../core/report.dart';
 import '../mesh/groups.dart';
 import '../mesh/mesh_node.dart';
 import '../mesh/message_store.dart';
@@ -53,6 +54,46 @@ const int kLowBatteryRecoverPercent = 50;
 /// 月 1 回の確認通知の文面（C07）。
 const String kMonthlyReminderTitle = '回覧板の 確認です。災害では ありません';
 const String kMonthlyReminderBody = '開いて 動いているか 確かめてください';
+
+/// 「受け取りました」（ack）の有効期間の上限（元の知らせの期限 + 24 時間、最大 72 時間）。
+const Duration kReportAckGrace = Duration(hours: 24);
+const Duration kReportAckMaxTtl = Duration(hours: 72);
+
+/// 同じ知らせを短い間に送り直そうとしたとき（C21）。
+class ReportTooSoonException implements Exception {
+  const ReportTooSoonException(this.type, this.sentAt);
+
+  final ReportType type;
+
+  /// 前に送った時刻（エポック秒）。
+  final int sentAt;
+
+  @override
+  String toString() => type == ReportType.sos
+      ? 'さきほど 送りました。もう少し 待ってから 送り直してください。急ぐときは 近所の 人にも 声を かけてください。'
+      : 'さきほど 送りました。受け取りの 返事を 待ってください。';
+}
+
+/// 住民からの知らせ 1 件（画面用）。
+class ReportEntry {
+  const ReportEntry({
+    required this.message,
+    required this.body,
+    required this.info,
+    this.ack,
+  });
+
+  final StoredMessage message;
+  final NoticeBody body;
+  final ReportInfo info;
+
+  /// 「受け取りました」。まだなら null。
+  final StoredMessage? ack;
+
+  int get msgId => message.msgId;
+  int get groupId => message.groupId;
+  bool get acked => ack != null;
+}
 
 /// OS 通知の出し方（docs/08 C05）。
 enum NotificationLevel {
@@ -446,6 +487,13 @@ class AppController extends ChangeNotifier {
   /// 連続受信をまとめるためのデバウンスタイマー。
   Timer? _noticeTimer;
 
+  /// すでに見た知らせ（kind=help）と「受け取りました」（kind=ack）の msg_id。
+  final Set<int> _knownReportIds = <int>{};
+
+  /// 背面で届いて、まだ通知していない住民からの知らせ（SOS 以外、到着順）。
+  final List<int> _pendingReportIds = <int>[];
+  Timer? _reportTimer;
+
   BatteryInfo? _battery;
   bool _autoLowPower = false;
   int? _keepScreenOnUntil;
@@ -555,6 +603,7 @@ class AppController extends ChangeNotifier {
     _store.officialGroupIds = _groups.officialCodes;
     // 起動時点で保存されていたものは「新着」ではない（通知しない）。
     _knownNoticeIds.addAll(_store.all.map((m) => m.msgId));
+    _knownReportIds.addAll(_store.all.map((m) => m.msgId));
 
     final node = MeshNode(
       transport: _transport,
@@ -605,6 +654,8 @@ class AppController extends ChangeNotifier {
     _purgeTimer = null;
     _noticeTimer?.cancel();
     _noticeTimer = null;
+    _reportTimer?.cancel();
+    _reportTimer = null;
     _keepScreenTimer?.cancel();
     _keepScreenTimer = null;
     _store.removeListener(_onStoreChanged);
@@ -632,6 +683,7 @@ class AppController extends ChangeNotifier {
   void _onStoreChanged() {
     _syncGroupInfoFromStore();
     _checkNewNotices();
+    _checkNewReports();
     notifyListeners();
   }
 
@@ -641,6 +693,7 @@ class AppController extends ChangeNotifier {
     // 参加した直後に見えるようになったお知らせは「新着」ではなく既知にする
     // （参加操作は前面でしか起きないので、ここでは通知にならない）。
     _checkNewNotices();
+    _checkNewReports();
     notifyListeners();
   }
 
@@ -683,6 +736,9 @@ class AppController extends ChangeNotifier {
     _noticeTimer?.cancel();
     _noticeTimer = null;
     _pendingNoticeIds.clear();
+    _reportTimer?.cancel();
+    _reportTimer = null;
+    _pendingReportIds.clear();
   }
 
   /// 画面の帯で緊急のお知らせを見たことにする（C05）。
@@ -956,6 +1012,176 @@ class AppController extends ChangeNotifier {
         debugPrint('通知を出せませんでした: $e');
       }),
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 住民からの知らせ（SOS・安否・在宅避難・困りごと）の OS 通知
+  // ---------------------------------------------------------------------------
+
+  /// ストアの変化を見て、本部・スタッフとして見られる新しい知らせと、
+  /// 自分の知らせへの「受け取りました」を通知する。前面のときは既知にするだけ
+  /// （画面の帯と一覧に任せる）。
+  void _checkNewReports() {
+    if (!_initialized) {
+      return;
+    }
+    final freshReports = <StoredMessage>[];
+    final freshAcks = <StoredMessage>[];
+    final now = _now();
+    for (final m in _store.all) {
+      if (m.kind != MessageKind.help && m.kind != MessageKind.ack) {
+        continue;
+      }
+      if (_knownReportIds.contains(m.msgId)) {
+        continue;
+      }
+      if (m.kind == MessageKind.help) {
+        if (m.isLocal || !canSeeReports(m.groupId)) {
+          // 見られない端末では保存・中継だけ。あとで本部になったら一覧には出る。
+          continue;
+        }
+        _knownReportIds.add(m.msgId);
+        if (_store.isDisplayable(m, now)) {
+          freshReports.add(m);
+        }
+      } else {
+        _knownReportIds.add(m.msgId);
+        final target = m.envelope.supersedes;
+        final t = target == null ? null : _store.get(target);
+        if (!m.isLocal && t != null && t.isLocal && t.kind == MessageKind.help) {
+          freshAcks.add(m);
+        }
+      }
+    }
+    _knownReportIds.removeWhere((id) => !_store.contains(id));
+    if (freshReports.isEmpty && freshAcks.isEmpty) {
+      return;
+    }
+    final platform = _platform;
+    if (_foreground ||
+        platform == null ||
+        _settings.notificationLevel == NotificationLevel.off) {
+      return;
+    }
+    for (final ack in freshAcks) {
+      final report = _store.get(ack.envelope.supersedes!);
+      final body = report?.envelope.help;
+      unawaited(platform
+          .showNotice(
+            id: ack.msgId & 0x7FFFFFFF,
+            title: '${ackSenderLabel(ack)}が 受け取りました',
+            body: body?.title ?? '送った 知らせが 届きました',
+            groupCode: ack.groupId,
+            importance: NoticeImportance.important,
+            msgId: report?.msgId,
+          )
+          .catchError((Object e) {
+        debugPrint('通知を出せませんでした: $e');
+      }));
+    }
+    final batched = <StoredMessage>[];
+    for (final m in freshReports) {
+      final entry = reportEntryOf(m);
+      if (entry != null &&
+          entry.info.type == ReportType.sos &&
+          _urgentAllowed(m.groupId)) {
+        unawaited(platform
+            .showNotice(
+              id: m.msgId & 0x7FFFFFFF,
+              title: '住民から SOS が 届きました',
+              body: reportNotificationBody(entry),
+              groupCode: m.groupId,
+              importance: NoticeImportance.urgent,
+              msgId: m.msgId,
+            )
+            .catchError((Object e) {
+          debugPrint('通知を出せませんでした: $e');
+        }));
+      } else {
+        batched.add(m);
+      }
+    }
+    if (batched.isEmpty) {
+      return;
+    }
+    _pendingReportIds.addAll(batched.map((m) => m.msgId));
+    _reportTimer?.cancel();
+    _reportTimer = (_createTimer ?? Timer.new)(
+      kNoticeNotificationDebounce,
+      _flushReportNotification,
+    );
+  }
+
+  /// 通知の本文（場所・人数・ひとこと）。
+  static String reportNotificationBody(ReportEntry e) {
+    final parts = <String>[];
+    if (e.body.place.isNotEmpty) {
+      parts.add('場所: ${e.body.place}');
+    }
+    final people = reportPeopleLabel(e.info.people);
+    if (people.isNotEmpty) {
+      parts.add(people);
+    }
+    if (e.body.text.trim().isNotEmpty) {
+      parts.add(_firstLine(e.body.text));
+    }
+    if (parts.isEmpty) {
+      parts.add(e.body.title);
+    }
+    return parts.join(' ／ ');
+  }
+
+  /// まとめ待ちの知らせを 1 件の OS 通知にして出す。
+  void _flushReportNotification() {
+    _reportTimer = null;
+    final platform = _platform;
+    if (platform == null ||
+        _foreground ||
+        _settings.notificationLevel == NotificationLevel.off) {
+      _pendingReportIds.clear();
+      return;
+    }
+    final now = _now();
+    final entries = <ReportEntry>[];
+    for (final id in _pendingReportIds) {
+      final m = _store.get(id);
+      if (m == null || !_store.isDisplayable(m, now)) {
+        continue;
+      }
+      final e = reportEntryOf(m);
+      if (e != null) {
+        entries.add(e);
+      }
+    }
+    final firstId = _pendingReportIds.isEmpty ? 0 : _pendingReportIds.first;
+    _pendingReportIds.clear();
+    if (entries.isEmpty) {
+      return;
+    }
+    final newest = entries.last;
+    final String title;
+    final String body;
+    if (entries.length == 1) {
+      title = '住民から: ${newest.body.title}';
+      body = reportNotificationBody(newest);
+    } else {
+      title = '住民からの 知らせが ${entries.length}件 届きました';
+      body = ReportSummary.of(
+              entries.map((e) => (info: e.info, acked: e.acked)))
+          .line();
+    }
+    unawaited(platform
+        .showNotice(
+          id: firstId & 0x7FFFFFFF,
+          title: title,
+          body: body,
+          groupCode: newest.groupId,
+          importance: NoticeImportance.important,
+          msgId: entries.length == 1 ? newest.msgId : null,
+        )
+        .catchError((Object e) {
+      debugPrint('通知を出せませんでした: $e');
+    }));
   }
 
   /// 参加グループの名前・ポリシー・拡張情報を、受け取った group_info から補完する。
@@ -1253,6 +1479,8 @@ class AppController extends ChangeNotifier {
   ///
   /// [supersedes] を渡すと「書きなおし」（元の msg_id を置き換える）。
   /// [training] なら見出しに「【訓練】」を付ける（公式・スタッフだけ、C23）。
+  /// [asksReply] なら「返事の ボタン」（無事です・家に います・助けて）を付けた
+  /// 安否確認にする（公式・スタッフだけ）。
   Future<Envelope> postNotice({
     required int groupCode,
     required NoticeCategory category,
@@ -1262,6 +1490,7 @@ class AppController extends ChangeNotifier {
     Duration? ttl,
     int? supersedes,
     bool training = false,
+    bool asksReply = false,
   }) async {
     final group = _groups.byCode(groupCode);
     if (group == null) {
@@ -1284,6 +1513,9 @@ class AppController extends ChangeNotifier {
       title: cleanTitle,
       place: place.trim(),
       text: text,
+      ext: asksReply && group.postRole != SenderRole.resident
+          ? noticeExtAskingReply()
+          : null,
     );
     var duration = ttl ?? category.defaultTtl;
     if (duration > kMaxNoticeTtl) {
@@ -1333,6 +1565,7 @@ class AppController extends ChangeNotifier {
       text: text,
       ttl: ttl,
       supersedes: msgId,
+      asksReply: noticeAsksReply(target.envelope.notice?.ext),
     );
   }
 
@@ -1421,6 +1654,272 @@ class AppController extends ChangeNotifier {
       await retract(m.msgId);
     }
     return targets.length;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 住民からの知らせ（SOS・無事です・在宅避難・困っています）
+  // ---------------------------------------------------------------------------
+
+  /// [groupCode] の知らせを見られるか（本部・スタッフの端末だけ、C21）。
+  bool canSeeReports(int groupCode) {
+    final g = _groups.byCode(groupCode);
+    return g != null && (g.canManage || g.isStaff);
+  }
+
+  /// 知らせを見られるグループがあるか。
+  bool get seesAnyReports => _groups.groups.any((g) => g.canManage || g.isStaff);
+
+  /// ホームの「本部に 知らせる」から送れるグループ（「受け付ける」が オンで、
+  /// 自分が本部・スタッフではないもの）。
+  List<JoinedGroup> get reportGroups => _groups.groups
+      .where((g) => g.acceptsHelp && !g.closed && !g.canManage && !g.isStaff)
+      .toList();
+
+  /// [m] が「返事を 求める」お知らせ（安否確認）か。
+  static bool asksReply(StoredMessage m) =>
+      noticeAsksReply(m.envelope.notice?.ext);
+
+  /// [groupCode] に知らせを送れるか。[inReplyTo] が同じグループの安否確認なら、
+  /// 「受け付ける」が オフでも送れる。
+  bool canReportTo(int groupCode, {int? inReplyTo}) {
+    final g = _groups.byCode(groupCode);
+    if (g == null || g.closed) {
+      return false;
+    }
+    if (g.acceptsHelp) {
+      return true;
+    }
+    if (inReplyTo == null) {
+      return false;
+    }
+    final request = _store.get(inReplyTo);
+    return request != null &&
+        request.groupId == groupCode &&
+        asksReply(request) &&
+        _store.isDisplayable(request, _now());
+  }
+
+  /// 知らせを送る（kind=help）。送れないグループなら [StateError]、
+  /// 同じ種類を短い間に送り直そうとしたら [ReportTooSoonException]。
+  Future<Envelope> sendReport({
+    required int groupCode,
+    required ReportType type,
+    int people = 0,
+    List<ReportNeed> needs = const <ReportNeed>[],
+    bool injured = false,
+    String place = '',
+    String name = '',
+    String note = '',
+    int? inReplyTo,
+  }) async {
+    final group = _groups.byCode(groupCode);
+    if (group == null) {
+      throw StateError('参加していないグループです（$groupCode）');
+    }
+    if (!canReportTo(groupCode, inReplyTo: inReplyTo)) {
+      throw StateError('この グループは 知らせを 受け付けて いません');
+    }
+    if (type.requiresNeeds && needs.isEmpty) {
+      throw ArgumentError.value(needs, 'needs', '困っている ことを 選んでください');
+    }
+    final createdAt = _now();
+    for (final m in _store.all) {
+      if (!m.isLocal ||
+          m.kind != MessageKind.help ||
+          m.groupId != groupCode ||
+          m.retracted) {
+        continue;
+      }
+      final e = reportEntryOf(m);
+      if (e == null || e.info.type != type) {
+        continue;
+      }
+      if (createdAt - m.envelope.createdAt < type.resendInterval.inSeconds) {
+        throw ReportTooSoonException(type, m.envelope.createdAt);
+      }
+    }
+    final info = ReportInfo(
+      type: type,
+      people: people.clamp(0, kReportPeopleMax),
+      needs: type.allowsNeeds ? needs : const <ReportNeed>[],
+      injured: type.allowsInjured && injured,
+      inReplyTo: inReplyTo,
+    );
+    final cleanName =
+        type.allowsName ? truncateUtf8(name.trim(), kMaxSenderNameBytes) : '';
+    final body = NoticeBody(
+      senderName: cleanName,
+      title: info.title(name: cleanName),
+      place: truncateUtf8(place.trim(), kMaxPlaceBytes),
+      text: truncateUtf8(note.trim(), 240),
+      ext: info.encode(),
+    );
+    final envelope = Envelope.create(
+      kind: MessageKind.help,
+      groupId: groupCode,
+      originId: nodeId,
+      createdAt: createdAt,
+      expiresAt: _clampEpoch(createdAt + type.ttl.inSeconds),
+      category: NoticeCategory.request,
+      role: group.postRole,
+      bodyPlain: body.encode(),
+    );
+    await node.publish(envelope);
+    return envelope;
+  }
+
+  /// 知らせ 1 件を画面用にまとめる。kind=help で読めなければ null。
+  ReportEntry? reportEntryOf(StoredMessage m) {
+    final body = m.envelope.help;
+    if (body == null) {
+      return null;
+    }
+    return ReportEntry(
+      message: m,
+      body: body,
+      info: ReportInfo.decode(body.ext) ?? const ReportInfo(type: ReportType.need),
+      ack: _store.ackFor(m.msgId),
+    );
+  }
+
+  /// 本部・スタッフとして見られる知らせ（自分が送ったものは除く、新しい順）。
+  /// [groupCode] でグループ、[inReplyTo] で安否確認への返事に絞る。
+  List<ReportEntry> receivedReports({int? groupCode, int? inReplyTo}) {
+    final ids = <int>{
+      for (final g in _groups.groups)
+        if ((g.canManage || g.isStaff) && (groupCode == null || g.code == groupCode))
+          g.code,
+    };
+    if (ids.isEmpty) {
+      return const [];
+    }
+    final out = <ReportEntry>[];
+    for (final m in _store.visibleHelpRequests(now: _now(), groupIds: ids)) {
+      if (m.isLocal) {
+        continue;
+      }
+      final e = reportEntryOf(m);
+      if (e == null) {
+        continue;
+      }
+      if (inReplyTo != null && e.info.inReplyTo != inReplyTo) {
+        continue;
+      }
+      out.add(e);
+    }
+    return out;
+  }
+
+  /// [entries] の集計。
+  static ReportSummary summarize(Iterable<ReportEntry> entries) =>
+      ReportSummary.of(entries.map((e) => (info: e.info, acked: e.acked)));
+
+  /// まだ受け取りの返事をしていない SOS の件数（本部・スタッフの端末）。
+  int get unackedSosCount => receivedReports()
+      .where((e) => e.info.type == ReportType.sos && !e.acked)
+      .length;
+
+  /// 自分が送った知らせ（期限内・取り消していないもの、新しい順）。
+  /// [inReplyTo] で安否確認への返事に絞る。
+  List<ReportEntry> myReports({int? inReplyTo}) {
+    final out = <ReportEntry>[];
+    final now = _now();
+    for (final m in _store.all) {
+      if (!m.isLocal || m.kind != MessageKind.help || !_store.isDisplayable(m, now)) {
+        continue;
+      }
+      final e = reportEntryOf(m);
+      if (e == null) {
+        continue;
+      }
+      if (inReplyTo != null && e.info.inReplyTo != inReplyTo) {
+        continue;
+      }
+      out.add(e);
+    }
+    out.sort((a, b) => b.message.envelope.createdAt.compareTo(a.message.envelope.createdAt));
+    return out;
+  }
+
+  /// 本部・スタッフが知らせに「受け取りました」を返す（kind=ack）。
+  /// すでに返していれば何もしない（null を返す）。
+  Future<Envelope?> acknowledgeReport(int msgId) async {
+    final target = _store.get(msgId);
+    if (target == null || target.kind != MessageKind.help) {
+      throw StateError('知らせが 見つかりません');
+    }
+    final group = _groups.byCode(target.groupId);
+    if (group == null || !(group.canManage || group.isStaff)) {
+      throw StateError('本部・スタッフの 端末だけが 返事を できます');
+    }
+    if (_store.ackFor(msgId) != null) {
+      return null;
+    }
+    final createdAt = _now();
+    var expiresAt = _max(_store.localExpiresAt(target), createdAt) +
+        kReportAckGrace.inSeconds;
+    final cap = createdAt + kReportAckMaxTtl.inSeconds;
+    if (expiresAt > cap) {
+      expiresAt = cap;
+    }
+    final ack = Envelope.create(
+      kind: MessageKind.ack,
+      groupId: target.groupId,
+      originId: nodeId,
+      createdAt: createdAt,
+      expiresAt: _clampEpoch(expiresAt),
+      category: NoticeCategory.request,
+      role: group.postRole,
+      supersedes: msgId,
+      bodyPlain: Uint8List(0),
+    );
+    await node.publish(ack);
+    return ack;
+  }
+
+  /// まだ返事をしていない知らせに、まとめて「受け取りました」を返す。返した件数。
+  Future<int> acknowledgeAll(Iterable<ReportEntry> entries) async {
+    var n = 0;
+    for (final e in entries) {
+      if (e.acked) {
+        continue;
+      }
+      if (await acknowledgeReport(e.msgId) != null) {
+        n++;
+      }
+    }
+    return n;
+  }
+
+  /// 「受け取りました」を出した人の呼び名（本部ならグループの発信者名、スタッフは「スタッフ」）。
+  String ackSenderLabel(StoredMessage ack) {
+    if (ack.envelope.role != SenderRole.official) {
+      return ack.envelope.role == SenderRole.staff ? 'スタッフ' : '係の人';
+    }
+    final info = _store.latestGroupInfo(ack.groupId)?.envelope.groupInfo;
+    final host = info?.hostName.trim() ?? '';
+    if (host.isNotEmpty) {
+      return host;
+    }
+    return '本部';
+  }
+
+  /// 知らせを文章にする（紙の台帳・無線で伝えるための写し）。
+  String reportsAsText(List<ReportEntry> entries) {
+    final lines = <String>[];
+    for (final e in entries) {
+      final t = dateTimeFromEpoch(e.message.receivedAt);
+      final parts = <String>[
+        _formatDateTime(t),
+        e.body.title,
+        if (e.body.place.isNotEmpty) '場所: ${e.body.place}',
+        if (e.body.text.trim().isNotEmpty) e.body.text.trim(),
+        e.acked ? '受け取り済み' : 'まだ 返事を していない',
+        '番号 ${bulletinNumber(e.msgId)}',
+      ];
+      lines.add(parts.join(' ／ '));
+    }
+    return lines.join('\n');
   }
 
   // ---------------------------------------------------------------------------

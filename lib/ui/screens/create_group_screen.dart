@@ -24,6 +24,7 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
   final _nameCtl = TextEditingController();
   final _descriptionCtl = TextEditingController();
   bool _membersCanPost = true;
+  bool _acceptsHelp = false;
   bool _creating = false;
 
   @override
@@ -44,6 +45,7 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
         name: name,
         membersCanPost: _membersCanPost,
         description: _descriptionCtl.text.trim(),
+        acceptsHelp: _acceptsHelp,
       );
       if (!mounted) {
         return;
@@ -118,27 +120,45 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
               side: BorderSide(color: KairanColors.borderDecorative),
             ),
             clipBehavior: Clip.antiAlias,
-            child: SwitchListTile(
-              value: _membersCanPost,
-              onChanged: _creating
-                  ? null
-                  : (v) => setState(() => _membersCanPost = v),
-              title: const Text('参加者も 投稿できる'),
-              subtitle: Text(
-                _membersCanPost
-                    ? 'オン: 参加した人は だれでも お知らせを 出せます。'
-                    : 'オフ: 本部コード・スタッフコードを 持つ人だけが お知らせを 出せます。',
-              ),
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 4,
-              ),
+            child: Column(
+              children: [
+                SwitchListTile(
+                  value: _membersCanPost,
+                  onChanged: _creating
+                      ? null
+                      : (v) => setState(() => _membersCanPost = v),
+                  title: const Text('参加者も 投稿できる'),
+                  subtitle: Text(
+                    _membersCanPost
+                        ? 'オン: 参加した人は だれでも お知らせを 出せます。'
+                        : 'オフ: 本部コード・スタッフコードを 持つ人だけが お知らせを 出せます。',
+                  ),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 4,
+                  ),
+                ),
+                const Divider(),
+                SwitchListTile(
+                  value: _acceptsHelp,
+                  onChanged: _creating
+                      ? null
+                      : (v) => setState(() => _acceptsHelp = v),
+                  title: const Text('住民からの 知らせを 受け付ける'),
+                  subtitle: const Text(
+                    'オンにすると、参加した 人が「本部に 知らせる」から SOS・無事です・在宅避難・困っています を 送れます。'
+                    '見る 係の 人を 置いてから オンにしてください（あとで 変えられます）。',
+                  ),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 4,
+                  ),
+                ),
+              ],
             ),
           ),
           const SizedBox(height: 16),
-          const InfoBox(
-            '作ると、あなたが 公式（本部）に なります。本部用と スタッフ用の 8桁の 番号も できます。',
-          ),
+          const InfoBox('作ると、あなたが 公式（本部）に なります。本部用と スタッフ用の 8桁の 番号も できます。'),
         ],
       ),
     );

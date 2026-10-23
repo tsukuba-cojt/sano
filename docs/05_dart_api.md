@@ -52,10 +52,11 @@ enum MessageKind { notice(0), groupInfo(1), tombstone(2), help(3), ack(4), unkno
 enum SenderRole { resident, staff, official; int get code; String get label; static SenderRole? fromCode(int code); } // label: 住民 / スタッフ / 公式
 
 class NoticeBody {   // kind=notice / help の body
-  const NoticeBody({required this.senderName, required this.title, this.place = '', this.text = ''});
+  const NoticeBody({required this.senderName, required this.title, this.place = '', this.text = '', this.ext});
   final String senderName, title, place, text;
-  Uint8List encode();                       // u16 len + UTF-8 ×4
-  static NoticeBody decode(Uint8List bytes); // 長さ超過・不正は EnvelopeFormatException。5 番目以降のフィールドは無視（v2: C13, C25）
+  final Uint8List? ext;                     // 5 番目のフィールド（≤ 64 B）。notice は「返事を 求める」印、help は種類など（v2.1）
+  Uint8List encode();                       // u16 len + UTF-8 ×4（ext があれば 5 番目に足す）
+  static NoticeBody decode(Uint8List bytes); // 4 フィールドの長さ超過・不正は EnvelopeFormatException。5 番目は読めなければ null、6 番目以降は無視（v2: C13, C25, v2.1）
 }
 
 class GroupInfoBody {
@@ -155,6 +156,28 @@ const int kMaxBodyPlainBytes = 4096;
 Uint8List compressBody(Uint8List plain);                 // raw deflate + kDictionaryV1
 Uint8List decompressBody(Uint8List data);                // 上限超過・破損は EnvelopeFormatException
 
+// ---------------- lib/core/report.dart ----------------（v2.1: C21 拡張）
+enum ReportType { sos(0), safe(1), home(2), need(3);   // 助けて（SOS）/ 無事です / 家に います（在宅避難）/ 困っています
+  final int code; final String label, shortLabel, titlePrefix, description;
+  final Duration ttl;                // SOS 24 時間、困りごと 2 日、無事・在宅 3 日
+  final Duration resendInterval;     // 同じ種類を送り直せるまで: SOS 10 分、ほか 30 分
+  final NoticeImportance importance; // 本部端末の通知（SOS は urgent）
+  final bool allowsName, allowsInjured, allowsNeeds, requiresNeeds;
+  static ReportType? fromCode(int code); }
+enum ReportNeed { water, medical, mobility, toilet, power, other; String get label; int get bit;  // 困りごと 6 択（宣言順がビット）
+  static List<ReportNeed> fromBits(int bits); static int toBits(Iterable<ReportNeed> needs); }
+const List<int> kReportPeopleChoices = [1, 2, 3, 4, 5]; // 5 は「5人以上」
+String reportPeopleLabel(int people);                    // 「3人」「5人以上」、0 は空
+class ReportInfo {   // help の ext: type u8 ‖ people u8 ‖ needs u8 ‖ flags u8 ‖ in_reply_to i64（省略可）
+  const ReportInfo({required this.type, this.people = 0, this.needs = const [], this.injured = false, this.inReplyTo});
+  Uint8List encode(); static ReportInfo? decode(Uint8List? ext); // 4 B 未満は null、未知の種類は need
+  String title({String name = ''});                              // 自動の見出し（≤ 120 B）
+}
+Uint8List noticeExtAskingReply(); bool noticeAsksReply(Uint8List? ext); // notice ext bit0 = 返事を 求める
+class ReportSummary { Map<ReportType, int> counts, people; int unacked, unackedSos; int get total;
+  static ReportSummary of(Iterable<({ReportInfo info, bool acked})> items); String line(); } // 「SOS 1件 ・ 無事 12件（20人）」
+String truncateUtf8(String s, int maxBytes);
+
 // ---------------- lib/core/dictionary.dart ----------------
 final Uint8List kDictionaryV1;  // 災害通知コーパス辞書（UTF-8、4〜8 KB）。v2 でも変えない（v2: C15）
 
@@ -229,8 +252,8 @@ class MessageStore extends ChangeNotifier {
       int? cutoffCreatedAt,             // 相手の INVENTORY_CUTOFF。それより古い notice / help は送らない（v2: C08）
       Set<int>? peerGroups,             // 相手の参加グループ。あればそのグループのものを先に（v2: C17）
       Set<int> exclude = const {}});    // 先出し済み（v2: C08）
-                                        // 優先順: kind（group_info → tombstone → ack → notice/help）→ peerGroups → role 降順 → created_at 降順。空殻は含めない
-  List<StoredMessage> pushCandidates({required int now, int maxCount = kPushMaxCount}); // 先出し候補: 参加グループの最新 group_info → tombstone（24 時間以内）→ 公式 notice（24 時間以内、未取消・未置き換え）（v2: C08）
+                                        // 優先順: kind（group_info → tombstone → ack → help → notice）→ peerGroups → role 降順 → created_at 降順。空殻は含めない（v2.1: help を notice の前に）
+  List<StoredMessage> pushCandidates({required int now, int maxCount = kPushMaxCount}); // 先出し候補: 参加グループの最新 group_info → tombstone（24 時間以内）→ 自分の help（24 時間以内・ack なし）→ 参加グループの ack（24 時間以内）→ 公式 notice（24 時間以内、未取消・未置き換え）（v2: C08, v2.1）
   List<StoredMessage> visibleNotices({required int now, Set<int>? groupIds, bool byReceived = false}); // notice, 表示可, 新しい順。byReceived なら届いた時刻の順（v2: C12）
   List<StoredMessage> visibleHelpRequests({required int now, Set<int>? groupIds}); // kind=help, 表示可, 新しい順（v2: C21）
   StoredMessage? ackFor(int msgId);     // msgId への「受け取りました」（kind=ack）。なければ null（v2: C21）
@@ -414,13 +437,33 @@ class AppController extends ChangeNotifier {
   String senderNameFor(JoinedGroup group);        // グループごとの発信元名 → ホスト名 → 設定の表示名（v2: C09）
   Future<Envelope> postNotice({required int groupCode, required NoticeCategory category, required String title, String place = '', String text = '', Duration? ttl,
       int? supersedes,                            // 「書きなおし」。元の msg_id（v2: C01）
-      bool training = false});                    // 公式・スタッフなら見出しに「【訓練】」を付ける（v2: C23）
+      bool training = false,                      // 公式・スタッフなら見出しに「【訓練】」を付ける（v2: C23）
+      bool asksReply = false});                   // 公式・スタッフなら返事の ボタンを 付けた安否確認にする（notice ext bit0、v2.1）
                                                   // role は group.postRole、sender_name は senderNameFor、ttl は 30 日で頭打ち（v2: C09, C02）
   Future<Envelope> supersedeNotice(int msgId, {NoticeCategory? category, required String title, String place = '', String text = '', Duration? ttl}); // 自分の投稿を書きなおす（v2: C01）
   Future<Envelope> endNotice(int msgId);          // 自分の投稿を「終わりました」で置き換える（見出しは category.endTitle、本文「（〇月〇日 午後〇時〇分に 終わりました）」、期限 12 時間）（v2: C01）
   bool canRetract(StoredMessage m);               // 本人、または同じグループの公式端末（v2: C10）
   Future<void> retract(int msgId);                // tombstone を発信。公式端末が他人の投稿を取り消すときは role=2（v2: C10）
   Future<int> retractTraining(int groupCode);     // 見出しが【訓練】の自分の投稿（公式端末は他人の分も）をすべて取り消す。件数を返す（v2: C23）
+  // 住民からの知らせ（v2: C21、v2.1 で SOS・安否・在宅避難に拡張）
+  bool canSeeReports(int groupCode); bool get seesAnyReports;     // 本部・スタッフの端末だけ
+  List<JoinedGroup> get reportGroups;             // 「本部に 知らせる」の送り先: acceptsHelp・未閉鎖・自分が本部/スタッフでないグループ
+  static bool asksReply(StoredMessage m);         // 返事を 求める お知らせ（安否確認）か
+  bool canReportTo(int groupCode, {int? inReplyTo}); // acceptsHelp、または同じグループの期限内の安否確認への返事
+  Future<Envelope> sendReport({required int groupCode, required ReportType type, int people = 0, List<ReportNeed> needs = const [],
+      bool injured = false, String place = '', String name = '', String note = '', int? inReplyTo});
+      // kind=help・category=14・role=postRole・TTL は type.ttl。送れなければ StateError、送り直しが早すぎれば ReportTooSoonException
+  ReportEntry? reportEntryOf(StoredMessage m);    // {message, body, info, ack}
+  List<ReportEntry> receivedReports({int? groupCode, int? inReplyTo}); // 本部・スタッフとして見られる知らせ（自分の分を除く、新しい順）
+  static ReportSummary summarize(Iterable<ReportEntry> entries);
+  int get unackedSosCount;                        // ホームの赤帯
+  List<ReportEntry> myReports({int? inReplyTo});  // 自分が送った知らせ（期限内・未取消、新しい順）
+  Future<Envelope?> acknowledgeReport(int msgId); // kind=ack（supersedes = 対象）。TTL は min(対象の期限 + 24 時間, 72 時間)。返事済みなら null
+  Future<int> acknowledgeAll(Iterable<ReportEntry> entries);
+  String ackSenderLabel(StoredMessage ack);       // 公式はグループ情報の host_name（なければ「本部」）、スタッフは「スタッフ」
+  String reportsAsText(List<ReportEntry> entries); // 紙の台帳・無線用の写し（1 件 1 行）
+  static String reportNotificationBody(ReportEntry e); // 「場所: 〇〇 ／ 2人 ／ ひとこと」
+  // 背面の通知: 本部・スタッフ端末は SOS を 1 件ずつ urgent（10 分 3 件まで）、ほかは 5 秒まとめて important。送った本人には ack を important で
   // グループ
   Future<JoinedGroup> createGroup({required String name, required bool membersCanPost, String description = '', bool acceptsHelp = false}); // group_info も発信（v2: C24, C21）
   Future<JoinedGroup> joinGroup(int code);        // store の latestGroupInfo から名前・方針を補完
@@ -465,6 +508,7 @@ class BleTransport implements Transport {
 - 日付・時刻の表示は `lib/ui/format.dart` に `formatDateTimeJa(DateTime)`（例「2026年10月11日 午後3時20分」）、`formatRelativeJa(Duration)`（「2時間前」）、`dateHeaderJa(DateTime)`（「今日」「きのう」「10月9日（木）」）を置く。
 - 一覧の並び順と日付見出しは `notices()`（届いた時刻の順）、カードの時刻は `envelope.createdAt`。固定枠は `pinnedAlerts()`。前面の赤帯は `foregroundUrgentIds` と `acknowledgeUrgent()`。（v2: C12, C03, C05）
 - 詳細の「終わりました」「書きなおす」「取り消す」は `endNotice` / `supersedeNotice` / `retract`。公式端末の「公式として 取り消す」は `canRetract` で出し分ける。読み上げは `speak` / `stopSpeaking`、掲示番号は `bulletinNumber`。（v2: C01, C10, C19）
+- 住民からの知らせ: ホームの「本部に 知らせる」は `reportGroups`、本部の帯は `seesAnyReports`・`receivedReports()`・`summarize()`。入力画面は `sendReport`（`ReportTooSoonException` の文言をそのまま出す）、一覧・詳細は `receivedReports` / `reportEntryOf` / `acknowledgeReport` / `acknowledgeAll` / `reportsAsText`、本人の状態は `myReports` と `ackSenderLabel`、取り消しは `retract`。安否確認の返事ボタンは `asksReply` と `canReportTo`。（v2.1）
 - 中継役の状態表示は `settings.relayMode`・`node.nearbyCount`・`node.lastReceivedAt`・`node.lastSentAt`・`store.count`。設定の電池欄は `battery` と `autoLowPower`。（v2: C04, C06）
 
 ## 改訂履歴
@@ -473,3 +517,4 @@ class BleTransport implements Transport {
 |---|---|---|
 | v1 | 2026-10-11 | 初版 |
 | v2 | 2026-10-21 | 実装に合わせて改訂。categories（例文・終わりました・重要度・訓練）、envelope（kind 3/4・不透明・空殻・supersedes 入り msg_id・GroupInfoBody の ext）、frames（TIME / INVENTORY_CUTOFF / caps / 参加グループ一覧）、ids（本部・スタッフコードとダイジェスト）、MessageStore（相対期限・不透明・先出し・目録の絞り込み・help/ack・世代）、SyncSession / MeshNode（中継役・時計差・lastSyncAt）、GroupManager（2 本のコード・発信元名・世代・閉鎖）、AppController / AppSettings / PlatformActions / BleTransport（通知 3 段階・電池・画面点灯・読み上げ・書きなおし・公式取消・訓練・引っ越し） |
+| v2.1 | 2026-10-23 | core/report.dart（ReportType・ReportNeed・ReportInfo・ReportSummary）、NoticeBody.ext、MessageStore の送信順・先出しに help / ack、AppController の知らせ API（sendReport・receivedReports・acknowledgeReport ほか）と postNotice の asksReply |

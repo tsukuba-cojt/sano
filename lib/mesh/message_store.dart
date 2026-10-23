@@ -373,7 +373,7 @@ class MessageStore extends ChangeNotifier {
   bool _shouldEraseBody(StoredMessage target) =>
       !target.isLocal &&
       !target.isStub &&
-      target.kind == MessageKind.notice &&
+      (target.kind == MessageKind.notice || target.kind == MessageKind.help) &&
       !officialGroupIds.contains(target.groupId);
 
   /// 新しく入った [message] を索引に反映し、表示状態が変わった既存メッセージを
@@ -773,16 +773,18 @@ class MessageStore extends ChangeNotifier {
         return 1;
       case MessageKind.ack:
         return 2;
-      case MessageKind.notice:
       case MessageKind.help:
-      case MessageKind.unknown:
+        // 住民からの知らせ（SOS・安否）は小さく急ぐので、お知らせより先に送る。
         return 3;
+      case MessageKind.notice:
+      case MessageKind.unknown:
+        return 4;
     }
   }
 
   /// 「自分にあって相手にない」有効なメッセージを送信優先順で返す。
   ///
-  /// 優先順: kind（group_info → tombstone → ack → notice）、
+  /// 優先順: kind（group_info → tombstone → ack → help → notice）、
   /// [peerGroups] があればそのグループのもの、role 降順、created_at 降順。
   /// 不透明メッセージは [peerRelaysUnknown] のときだけ、[cutoffCreatedAt] より
   /// 古い notice は送らない（C08 C13）。[exclude] は先出し済み。
@@ -833,8 +835,10 @@ class MessageStore extends ChangeNotifier {
   }
 
   /// HELLO 直後に先出しする候補（C08）: 参加グループの最新 group_info →
-  /// 参加グループの tombstone（24 時間以内）→ 参加グループの公式 notice
-  /// （24 時間以内、取消・置き換え済みを除く）。それぞれ新しい順。
+  /// 参加グループの tombstone（24 時間以内）→ 自分が出した知らせ（kind=help、
+  /// 24 時間以内、まだ「受け取りました」が無いもの）→ 参加グループの ack
+  /// （24 時間以内）→ 参加グループの公式 notice（24 時間以内、取消・置き換え済みを
+  /// 除く）。それぞれ新しい順。
   List<StoredMessage> pushCandidates({
     required int now,
     int maxCount = kPushMaxCount,
@@ -868,7 +872,36 @@ class MessageStore extends ChangeNotifier {
             m.supersededBy == null)
         .toList()
       ..sort(_newestFirst);
-    final out = <StoredMessage>[...infos, ...tombstones, ...officials];
+    final ackedTargets = <int>{
+      for (final m in _messages.values)
+        if (m.kind == MessageKind.ack && m.envelope.supersedes != null)
+          m.envelope.supersedes!,
+    };
+    final reports = _messages.values
+        .where((m) =>
+            m.kind == MessageKind.help &&
+            m.isLocal &&
+            recent(m) &&
+            _isRelayable(m, now) &&
+            !m.retracted &&
+            !ackedTargets.contains(m.msgId))
+        .toList()
+      ..sort(_newestFirst);
+    final acks = _messages.values
+        .where((m) =>
+            m.kind == MessageKind.ack &&
+            joinedGroupIds.contains(m.groupId) &&
+            recent(m) &&
+            _isRelayable(m, now))
+        .toList()
+      ..sort(_newestFirst);
+    final out = <StoredMessage>[
+      ...infos,
+      ...tombstones,
+      ...reports,
+      ...acks,
+      ...officials,
+    ];
     return out.length > maxCount ? out.sublist(0, maxCount) : out;
   }
 

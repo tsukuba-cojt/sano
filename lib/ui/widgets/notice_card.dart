@@ -40,6 +40,7 @@ class NoticeCard extends StatelessWidget {
     this.endsAt,
     this.endingSoon = false,
     this.clockSuspicious = false,
+    this.asksReply = false,
     required this.onTap,
   });
 
@@ -84,6 +85,9 @@ class NoticeCard extends StatelessWidget {
 
   /// 発信側の時計がずれているかもしれない（時刻を灰色にして注記）。
   final bool clockSuspicious;
+
+  /// 返事の ボタンが 付いた 安否確認。
+  final bool asksReply;
   final VoidCallback onTap;
 
   bool get _inactive => retracted || superseded;
@@ -104,6 +108,7 @@ class NoticeCard extends StatelessWidget {
       ..write(training ? '訓練、' : '')
       ..write('${category.label}、${role.label}、')
       ..write(isNew ? '新着、' : '')
+      ..write(asksReply && !_inactive ? '返事を ください、' : '')
       ..write(ended ? '終わりました、' : (rewrite ? '書きなおし、' : ''))
       ..write(retracted ? '$retractedLabel、' : '')
       ..write(superseded ? '新しい内容に 置き換えられました、' : '')
@@ -154,6 +159,8 @@ class NoticeCard extends StatelessWidget {
                             CategoryTag(category.label),
                             RoleBadge(role),
                             if (isNew && !_inactive) const NewTag(),
+                            if (asksReply && !_inactive)
+                              const CautionTag('返事を ください'),
                             if (ended)
                               const StateTag('終わりました')
                             else if (rewrite)
