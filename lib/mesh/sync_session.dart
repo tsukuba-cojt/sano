@@ -640,7 +640,10 @@ class SyncSession {
       return;
     }
     _state = SessionState.transfer;
-    _logLine('相手の在庫 ${_peerHas.length} 件');
+    final filter = _peerFilter;
+    _logLine(filter != null
+        ? '相手の在庫 ${filter.itemCount} 件（要約 ${filter.bits.length} B）'
+        : '相手の在庫 ${_peerHas.length} 件');
     if (!_peerInventoryEnd.isCompleted) {
       _peerInventoryEnd.complete();
     }
