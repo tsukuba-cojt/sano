@@ -39,6 +39,10 @@ const int kCapGroupList = 0x04;
 /// HELLO caps bit3: HELLO 直後の先出し（PUSH）を受けられる（C08）。
 const int kCapPush = 0x08;
 
+/// HELLO caps bit4: 目録を要約（INVENTORY_FILTER、Bloom フィルタ）で送受できる（v2.3）。
+/// 双方が立てているときだけ、msg_id の列の代わりに要約を送る。
+const int kCapInventoryFilter = 0x10;
+
 /// MESSAGES_END payload bit0: 送信上限で打ち切った（続きがある）。
 const int kMessagesEndMore = 0x01;
 
@@ -47,7 +51,7 @@ const int kMessagesEndMore = 0x01;
 const int kMessagesEndPollMe = 0x02;
 
 /// この実装が常に立てる caps。
-const int kDefaultCaps = kCapRelayUnknown | kCapPush;
+const int kDefaultCaps = kCapRelayUnknown | kCapPush | kCapInventoryFilter;
 
 /// フレームの種類。
 enum FrameType {
@@ -60,6 +64,9 @@ enum FrameType {
 
   /// u32 目録最古の created_at。INVENTORY_END の直前（C08）。
   inventoryCutoff(0x05),
+
+  /// 目録の要約（Bloom フィルタ）。INVENTORY の代わりに 1 つだけ送る（v2.3）。
+  inventoryFilter(0x06),
   message(0x10),
   messagesEnd(0x11),
   bye(0x20);
@@ -187,6 +194,10 @@ class Frame {
   }
 
   static Frame inventoryEnd() => Frame(FrameType.inventoryEnd.code, Uint8List(0));
+
+  /// INVENTORY_FILTER（payload は [InventoryFilter.encode] の結果、v2.3）。
+  static Frame inventoryFilter(Uint8List payload) =>
+      Frame(FrameType.inventoryFilter.code, payload);
 
   /// TIME: u32 現在エポック秒（C12）。
   static Frame time(int epochSeconds) =>

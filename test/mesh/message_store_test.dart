@@ -334,7 +334,7 @@ void main() {
         await store.add(e, now: kT0 + 10);
       }
       final order = store
-          .messagesMissingFrom(<int>{}, now: kT0 + 10)
+          .messagesMissingFrom(<int>{}.contains, now: kT0 + 10)
           .map((m) => m.kind == MessageKind.notice
               ? m.envelope.notice!.title
               : m.kind.name)
@@ -345,7 +345,7 @@ void main() {
       expect(store.inventory(now: kT0 + 10), contains(notices[0].msgId));
 
       final filtered = store.messagesMissingFrom(
-          {info.msgId, notices[4].msgId, notices[1].msgId},
+          {info.msgId, notices[4].msgId, notices[1].msgId}.contains,
           now: kT0 + 10);
       expect(
           filtered

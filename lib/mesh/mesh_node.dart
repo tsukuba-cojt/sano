@@ -177,6 +177,11 @@ class MeshNode extends ChangeNotifier {
   StreamSubscription<TransportEvent>? _subscription;
   final Map<String, PeerRecord> _peers = <String, PeerRecord>{};
   final Map<String, _NodeSync> _nodeSync = <String, _NodeSync>{};
+
+  /// 相手（ノード ID）が持っているはずの msg_id と、記録した時刻。途中で切れた
+  /// セッションの分も足しておき、次のすれ違いの先出しで同じものを送り直さない（v2.3）。
+  final Map<String, ({int at, Set<int> ids})> _peerKnown =
+      <String, ({int at, Set<int> ids})>{};
   final Map<int, SyncSession> _sessions = <int, SyncSession>{};
   final Map<String, int> _pendingConnects = <String, int>{};
   final Set<SyncSession> _abortedByNode = <SyncSession>{};
@@ -368,6 +373,7 @@ class MeshNode extends ChangeNotifier {
     // 1 時間以上同期していない相手の記録は捨てる（メモリを増やし続けない）。
     final t = _now();
     _nodeSync.removeWhere((_, v) => t - v.lastSyncAt > 3600);
+    _peerKnown.removeWhere((_, v) => t - v.at > 3600);
     // アドレスが変わるたびに記録が増えるので、30 分見ていない相手は忘れる。
     _peers.removeWhere((id, p) =>
         t - p.lastSeen > kForgetPeerSeconds &&
@@ -642,6 +648,7 @@ class MeshNode extends ChangeNotifier {
       groupIds: groupIds,
       onPeerTime: _onPeerTime,
       cannotReachPeer: _cannotReach,
+      knownPeerIds: (node) => _peerKnown[hexOf(node)]?.ids,
     );
     _sessions[e.linkId] = session;
     _totalSessions++;
@@ -732,6 +739,12 @@ class MeshNode extends ChangeNotifier {
     }
     if (session.messagesSent > 0) {
       _lastSentAt = t;
+    }
+    if (hex != null) {
+      final ids = session.succeeded
+          ? session.knownByPeer
+          : <int>{...?_peerKnown[hex]?.ids, ...session.knownByPeerConfirmed};
+      _peerKnown[hex] = (at: t, ids: ids);
     }
     if (session.succeeded) {
       p.failures = 0;

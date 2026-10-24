@@ -14,7 +14,9 @@ library;
 
 import 'package:flutter/foundation.dart';
 
+import '../core/categories.dart';
 import '../core/envelope.dart';
+import '../core/report.dart';
 import 'store_file.dart';
 
 /// 中継しなくなる hop 数（これ以上は保存もしない）。
@@ -97,6 +99,10 @@ class StoredMessage {
   /// tombstone / 書きなおしを対象より長く保持するための期限（対象の実効期限 + 24 時間）。
   /// 対象を見たときに決まり、対象が消えた後も有効。
   int? retainUntil;
+
+  /// 同じグループのもっと新しい group_info がある古い版か。中継せず、満杯のときは
+  /// 先に消す（v2.3）。保存はしておき、相手から同じものを受け取り直さないようにする。
+  bool staleInfo = false;
 
   Uint8List? _wireCache;
 
@@ -334,6 +340,9 @@ class MessageStore extends ChangeNotifier {
     var erased = false;
     if (!envelope.isOpaque) {
       erased = _indexNew(message, touched);
+      if (envelope.kind == MessageKind.groupInfo) {
+        _refreshInfoStaleness(envelope.groupId);
+      }
     }
     _version++;
 
@@ -545,6 +554,13 @@ class MessageStore extends ChangeNotifier {
         }
       }
     }
+    final infoGroups = <int>{
+      for (final m in _messages.values)
+        if (m.kind == MessageKind.groupInfo) m.groupId,
+    };
+    for (final g in infoGroups) {
+      _refreshInfoStaleness(g);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -583,9 +599,14 @@ class MessageStore extends ChangeNotifier {
   bool _isListable(StoredMessage m, int now) =>
       m.envelope.hop < kMaxRelayHop && !isExpired(m, now);
 
-  /// 期限内で中継可能か（空殻は送らない）。
+  /// 期限内で中継可能か（v2.3）。空殻・書きなおされた古い版・古い group_info は
+  /// 送らない（受け取った側にはもう要らない。新しい版だけが広がればよい）。
+  /// 目録には載せるので、相手から同じものを受け取り直すことはない。
   bool _isRelayable(StoredMessage m, int now) =>
-      _isListable(m, now) && !m.isStub;
+      _isListable(m, now) &&
+      !m.isStub &&
+      m.supersededBy == null &&
+      !m.staleInfo;
 
   /// 上限に収まるよう削除する（追加前に呼ぶ）。満杯なら 10% をまとめて削除する。
   /// 削除したものを返す。
@@ -678,6 +699,10 @@ class MessageStore extends ChangeNotifier {
     if (m.isLocal) {
       return 9;
     }
+    if (m.supersededBy != null || m.staleInfo) {
+      // 新しい版がある古い版（中継しない）。
+      return 1;
+    }
     final base = joinedGroupIds.contains(m.groupId) ? 5 : 2;
     return base + m.envelope.role.code;
   }
@@ -691,6 +716,19 @@ class MessageStore extends ChangeNotifier {
     if (target != null) {
       _tombstoneTargets[target]?.remove(m.msgId);
       _supersedeTargets[target]?.remove(m.msgId);
+    }
+    if (m.kind == MessageKind.groupInfo) {
+      _refreshInfoStaleness(m.groupId);
+    }
+  }
+
+  /// [groupId] の group_info のうち最新以外に [StoredMessage.staleInfo] を立てる。
+  void _refreshInfoStaleness(int groupId) {
+    final latest = latestGroupInfo(groupId);
+    for (final m in _messages.values) {
+      if (m.kind == MessageKind.groupInfo && m.groupId == groupId) {
+        m.staleInfo = latest != null && !identical(m, latest);
+      }
     }
   }
 
@@ -775,31 +813,76 @@ class MessageStore extends ChangeNotifier {
         cutoffCreatedAt: cutoff);
   }
 
-  static int _kindPriority(MessageKind kind) {
-    switch (kind) {
-      case MessageKind.groupInfo:
-        return 0;
-      case MessageKind.tombstone:
-        return 1;
-      case MessageKind.ack:
-        return 2;
+  /// 「受け取りました」が届いている知らせ（kind=help）の msg_id。
+  Set<int> _ackedTargets() => <int>{
+        for (final m in _messages.values)
+          if (m.kind == MessageKind.ack && m.envelope.supersedes != null)
+            m.envelope.supersedes!,
+      };
+
+  /// 送る順の段（小さいほど先、v2.3）。すれ違いが短くても大事なものから渡す。
+  ///
+  /// 0: SOS（まだ受け取りの返事がないもの）・公式とスタッフの避難情報と注意喚起
+  /// 1: 取り消し・受け取りました・group_info（小さく、表示を正すもの）
+  /// 2: そのほかの住民の知らせ（無事・在宅避難・困りごと、返事がないもの）
+  /// 3: 公式とスタッフの大事なお知らせ（避難所・給水・炊き出し・物資・医療）
+  /// 4: そのほかの公式とスタッフのお知らせ・返事を済ませた知らせ
+  /// 5: 住民のお知らせ・新しい版の封筒（不透明）
+  /// 6: 訓練のお知らせ
+  int sendTier(StoredMessage m) => _sendTier(m, _ackedTargets());
+
+  int _sendTier(StoredMessage m, Set<int> acked) {
+    if (m.isOpaque) {
+      return 5;
+    }
+    switch (m.kind) {
       case MessageKind.help:
-        // 住民からの知らせ（SOS・安否）は小さく急ぐので、お知らせより先に送る。
-        return 3;
+        if (acked.contains(m.msgId)) {
+          return 4;
+        }
+        final info = ReportInfo.decode(m.envelope.help?.ext);
+        return info?.type == ReportType.sos ? 0 : 2;
       case MessageKind.notice:
+        final NoticeBody? body;
+        try {
+          body = m.envelope.notice;
+        } on EnvelopeFormatException {
+          return 5;
+        }
+        if (body == null) {
+          return 5;
+        }
+        if (isTrainingTitle(body.title)) {
+          return 6;
+        }
+        if (m.envelope.role == SenderRole.resident) {
+          return 5;
+        }
+        switch (m.envelope.category.importance) {
+          case NoticeImportance.urgent:
+            return 0;
+          case NoticeImportance.important:
+            return 3;
+          case NoticeImportance.normal:
+            return 4;
+        }
+      case MessageKind.tombstone:
+      case MessageKind.ack:
+      case MessageKind.groupInfo:
+        return 1;
       case MessageKind.unknown:
-        return 4;
+        return 5;
     }
   }
 
   /// 「自分にあって相手にない」有効なメッセージを送信優先順で返す。
   ///
-  /// 優先順: kind（group_info → tombstone → ack → help → notice）、
-  /// [peerGroups] があればそのグループのもの、role 降順、created_at 降順。
-  /// 不透明メッセージは [peerRelaysUnknown] のときだけ、[cutoffCreatedAt] より
-  /// 古い notice は送らない（C08 C13）。[exclude] は先出し済み。
+  /// [peerHas] は相手が持っているか（目録の集合か、要約の判定、v2.3）。
+  /// 優先順: [sendTier]、[peerGroups] があればそのグループのもの、role 降順、
+  /// created_at 降順。不透明メッセージは [peerRelaysUnknown] のときだけ、
+  /// [cutoffCreatedAt] より古い notice は送らない（C08 C13）。[exclude] は先出し済み。
   List<StoredMessage> messagesMissingFrom(
-    Set<int> peerHas, {
+    bool Function(int msgId) peerHas, {
     required int now,
     bool peerRelaysUnknown = false,
     int? cutoffCreatedAt,
@@ -807,7 +890,7 @@ class MessageStore extends ChangeNotifier {
     Set<int> exclude = const <int>{},
   }) {
     final missing = _messages.values.where((m) {
-      if (peerHas.contains(m.msgId) || exclude.contains(m.msgId)) {
+      if (exclude.contains(m.msgId) || peerHas(m.msgId)) {
         return false;
       }
       if (!_isRelayable(m, now)) {
@@ -822,9 +905,11 @@ class MessageStore extends ChangeNotifier {
         return false;
       }
       return true;
-    }).toList()
-      ..sort((a, b) {
-        final k = _kindPriority(a.kind).compareTo(_kindPriority(b.kind));
+    }).toList();
+    final acked = _ackedTargets();
+    final tiers = <int, int>{for (final m in missing) m.msgId: _sendTier(m, acked)};
+    missing.sort((a, b) {
+        final k = tiers[a.msgId]!.compareTo(tiers[b.msgId]!);
         if (k != 0) {
           return k;
         }
@@ -844,76 +929,69 @@ class MessageStore extends ChangeNotifier {
     return missing;
   }
 
-  /// HELLO 直後に先出しする候補（C08）: 参加グループの最新 group_info →
-  /// 参加グループの tombstone（24 時間以内）→ 自分が出した知らせ（kind=help、
-  /// 24 時間以内、まだ「受け取りました」が無いもの）→ 参加グループの ack
-  /// （24 時間以内）→ 参加グループの公式 notice（24 時間以内、取消・置き換え済みを
-  /// 除く）。それぞれ新しい順。
+  /// HELLO 直後に先出しする候補（C08、v2.3 で見直し）。すれ違いが一瞬でも
+  /// 命に関わるものが先に渡るよう、目録の交換を待たずに送る。それぞれ新しい順:
+  ///
+  /// 1. SOS（どのグループでも、24 時間以内、まだ受け取りの返事がないもの。中継中の
+  ///    ほかの人の SOS を含む）
+  /// 2. 公式・スタッフの避難情報と注意喚起（どのグループでも、24 時間以内、訓練を除く）
+  /// 3. 参加グループの tombstone（24 時間以内）
+  /// 4. 参加グループの最新 group_info
+  /// 5. 自分が出した知らせ（24 時間以内、返事がないもの）
+  /// 6. 参加グループの ack（24 時間以内）
+  /// 7. 参加グループの公式 notice（24 時間以内）
+  ///
+  /// [skip] は相手がもう持っていると分かっているもの（前回の同期の記録）。
   List<StoredMessage> pushCandidates({
     required int now,
     int maxCount = kPushMaxCount,
+    Set<int> skip = const <int>{},
   }) {
     final since = now - kPushWindowSeconds;
     bool recent(StoredMessage m) =>
         (m.isLocal ? m.envelope.createdAt : m.receivedAt) >= since;
+    bool ok(StoredMessage m) =>
+        !skip.contains(m.msgId) && recent(m) && _isRelayable(m, now) && !m.retracted;
+    final acked = _ackedTargets();
+    List<StoredMessage> pick(bool Function(StoredMessage m) test) =>
+        _messages.values.where((m) => ok(m) && test(m)).toList()..sort(_newestFirst);
+
+    final sos = pick((m) =>
+        m.kind == MessageKind.help &&
+        !acked.contains(m.msgId) &&
+        _sendTier(m, acked) == 0);
+    final alerts = pick((m) => m.kind == MessageKind.notice && _sendTier(m, acked) == 0);
+    final tombstones = pick((m) =>
+        m.kind == MessageKind.tombstone && joinedGroupIds.contains(m.groupId));
     final infos = <StoredMessage>[];
     for (final g in joinedGroupIds) {
       final info = latestGroupInfo(g);
-      if (info != null && _isRelayable(info, now)) {
+      if (info != null && !skip.contains(info.msgId) && _isRelayable(info, now)) {
         infos.add(info);
       }
     }
-    final tombstones = _messages.values
-        .where((m) =>
-            m.kind == MessageKind.tombstone &&
-            joinedGroupIds.contains(m.groupId) &&
-            recent(m) &&
-            _isRelayable(m, now))
-        .toList()
-      ..sort(_newestFirst);
-    final officials = _messages.values
-        .where((m) =>
-            m.kind == MessageKind.notice &&
-            m.envelope.role == SenderRole.official &&
-            joinedGroupIds.contains(m.groupId) &&
-            recent(m) &&
-            _isRelayable(m, now) &&
-            !m.retracted &&
-            m.supersededBy == null)
-        .toList()
-      ..sort(_newestFirst);
-    final ackedTargets = <int>{
-      for (final m in _messages.values)
-        if (m.kind == MessageKind.ack && m.envelope.supersedes != null)
-          m.envelope.supersedes!,
-    };
-    final reports = _messages.values
-        .where((m) =>
-            m.kind == MessageKind.help &&
-            m.isLocal &&
-            recent(m) &&
-            _isRelayable(m, now) &&
-            !m.retracted &&
-            !ackedTargets.contains(m.msgId))
-        .toList()
-      ..sort(_newestFirst);
-    final acks = _messages.values
-        .where((m) =>
-            m.kind == MessageKind.ack &&
-            joinedGroupIds.contains(m.groupId) &&
-            recent(m) &&
-            _isRelayable(m, now))
-        .toList()
-      ..sort(_newestFirst);
-    final out = <StoredMessage>[
-      ...infos,
-      ...tombstones,
-      ...reports,
-      ...acks,
-      ...officials,
-    ];
-    return out.length > maxCount ? out.sublist(0, maxCount) : out;
+    final reports = pick((m) =>
+        m.kind == MessageKind.help && m.isLocal && !acked.contains(m.msgId));
+    final acks = pick((m) => m.kind == MessageKind.ack && joinedGroupIds.contains(m.groupId));
+    final officials = pick((m) =>
+        m.kind == MessageKind.notice &&
+        m.envelope.role == SenderRole.official &&
+        joinedGroupIds.contains(m.groupId));
+    final out = <StoredMessage>[];
+    final seen = <int>{};
+    for (final list in [sos, alerts, tombstones, infos, reports, acks, officials]) {
+      for (final m in list) {
+        if (seen.add(m.msgId)) {
+          out.add(m);
+          if (out.length >= maxCount) {
+            return out;
+          }
+        }
+      }
+    }
+    return out;
   }
+
 
   /// 表示対象の notice（期限内・未取消・未上書き）を新しい順に返す。
   /// [groupIds] を渡すとそのグループだけに絞る。[byReceived] なら届いた時刻の順。

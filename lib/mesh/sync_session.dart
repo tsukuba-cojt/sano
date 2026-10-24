@@ -14,6 +14,7 @@ import 'dart:typed_data';
 
 import '../core/envelope.dart';
 import '../core/frames.dart';
+import '../core/inventory_filter.dart';
 import '../core/ids.dart';
 import 'message_store.dart';
 
@@ -93,6 +94,7 @@ class SyncSession {
     this.groupIds = const [],
     this.onPeerTime,
     this.cannotReachPeer,
+    this.knownPeerIds,
   }) : maxChunk = maxChunk < 1 ? 1 : maxChunk,
        _createTimer = createTimer ?? _realTimer,
        _byteBudget = _budgetFor(sessionByteBudget, maxChunk);
@@ -133,6 +135,9 @@ class SyncSession {
   /// true なら MESSAGES_END で「短い間隔で同期しに来てほしい」と伝える。
   final bool Function(SyncSession session)? cannotReachPeer;
 
+  /// 相手（ノード ID）が前回の同期の後に持っているはずの msg_id（先出しを省く、v2.3）。
+  final Set<int>? Function(Uint8List nodeId)? knownPeerIds;
+
   /// 相手の TIME を受け取ったときに呼ばれる（相手の時計 − 自分の時計、秒）。
   final void Function(int offsetSeconds)? onPeerTime;
 
@@ -149,6 +154,19 @@ class SyncSession {
 
   final FrameParser _parser = FrameParser();
   final Set<int> _peerHas = <int>{};
+
+  /// 相手の目録の要約（INVENTORY_FILTER、v2.3）。
+  InventoryFilter? _peerFilter;
+
+  /// 自分の要約に使う salt（セッションごとに変え、偽陽性で送られなかったものが
+  /// 次のすれ違いで送られるようにする）。
+  final int _salt = InventoryFilter.randomSalt();
+
+  /// 相手の HELLO が届いた（目録の形式を決めるため待つ）。
+  final Completer<void> _peerHelloReceived = Completer<void>();
+
+  /// 先出しが終わるまで（先出しを目録より先に流す）。
+  Future<void> _pushDone = Future<void>.value();
   final Set<int> _pushed = <int>{};
   final List<int> _sentIds = <int>[];
 
@@ -229,7 +247,37 @@ class SyncSession {
 
   /// このセッションの後に相手が持っているはずの msg_id（相手の目録 ∪ 渡したもの
   /// ∪ 受け取ったもの）。次に同期し直す必要があるかの判定に使う。
-  Set<int> get knownByPeer => <int>{..._peerHas, ..._sentIds, ..._receivedIds};
+  Set<int> get knownByPeer {
+    final known = <int>{..._peerHas, ..._sentIds, ..._receivedIds};
+    final filter = _peerFilter;
+    if (filter != null) {
+      for (final m in _store.all) {
+        if (filter.mightContain(m.msgId)) {
+          known.add(m.msgId);
+        }
+      }
+    }
+    return known;
+  }
+
+  /// 途中で切れたセッションでも確かな「相手が持っているもの」（相手の目録 ∪
+  /// 相手から受け取ったもの。渡したものは届いたか分からないので含めない）。
+  Set<int> get knownByPeerConfirmed {
+    final known = <int>{..._peerHas, ..._receivedIds};
+    final filter = _peerFilter;
+    if (filter != null) {
+      for (final m in _store.all) {
+        if (filter.mightContain(m.msgId)) {
+          known.add(m.msgId);
+        }
+      }
+    }
+    return known;
+  }
+
+  /// 相手が [msgId] を持っているか（目録の一覧、または要約での判定）。
+  bool _peerMayHave(int msgId) =>
+      _peerHas.contains(msgId) || (_peerFilter?.mightContain(msgId) ?? false);
 
   /// 新規に保存できた受信 MESSAGE の件数。
   int get messagesReceived => _messagesReceived;
@@ -258,8 +306,8 @@ class SyncSession {
   /// 終了（成功 / 失敗どちらでも完了する。エラーにはならない）。
   Future<void> get done => _doneCompleter.future;
 
-  /// HELLO と INVENTORY（+END）を送る。送り終えたら完了する。
-  /// 以降の転送はバックグラウンドで続く（[done] で待つ）。
+  /// HELLO と TIME を送る。送り終えたら完了する。目録（相手の HELLO を見て
+  /// 要約か一覧かを決める）以降の転送はバックグラウンドで続く（[done] で待つ）。
   Future<void> start() {
     if (_started) {
       return _startCompleter.future;
@@ -297,20 +345,39 @@ class SyncSession {
         groupIds: isRelay ? groupIds : const [],
       ).encode());
       await _enqueueSend(Frame.time(now).encode());
-      final selection = _store.inventorySelection(
-          now: now, small: maxChunk < kSmallChunkThreshold);
-      for (final frame in Frame.inventoryFrames(selection.msgIds)) {
-        await _enqueueSend(frame.encode());
-      }
-      final cutoff = selection.cutoffCreatedAt;
-      if (cutoff != null) {
-        await _enqueueSend(Frame.inventoryCutoff(cutoff).encode());
-      }
-      await _enqueueSend(Frame.inventoryEnd().encode());
-      _logLine('HELLO と在庫 ${selection.msgIds.length} 件を送信'
-          '${cutoff != null ? '（絞り込み）' : ''}');
       if (!_startCompleter.isCompleted) {
         _startCompleter.complete();
+      }
+      // 相手の HELLO を見て目録の形式を決める。先出し（SOS・避難情報など）を先に流す。
+      await _peerHelloReceived.future;
+      if (isFinished) {
+        return;
+      }
+      await _pushDone;
+      if (isFinished) {
+        return;
+      }
+      if ((caps & kCapInventoryFilter) != 0 &&
+          (peerCaps & kCapInventoryFilter) != 0) {
+        // 双方が対応していれば、目録を要約（約 1/7 の大きさ）で送る。
+        final ids = _store.inventory(now: _now());
+        final filter = InventoryFilter.build(ids, salt: _salt);
+        await _enqueueSend(Frame.inventoryFilter(filter.encode()).encode());
+        await _enqueueSend(Frame.inventoryEnd().encode());
+        _logLine('在庫 ${ids.length} 件を要約で送信（${filter.bits.length} B）');
+      } else {
+        final selection = _store.inventorySelection(
+            now: _now(), small: maxChunk < kSmallChunkThreshold);
+        for (final frame in Frame.inventoryFrames(selection.msgIds)) {
+          await _enqueueSend(frame.encode());
+        }
+        final cutoff = selection.cutoffCreatedAt;
+        if (cutoff != null) {
+          await _enqueueSend(Frame.inventoryCutoff(cutoff).encode());
+        }
+        await _enqueueSend(Frame.inventoryEnd().encode());
+        _logLine('在庫 ${selection.msgIds.length} 件を送信'
+            '${cutoff != null ? '（絞り込み）' : ''}');
       }
 
       await _peerInventoryEnd.future;
@@ -319,7 +386,7 @@ class SyncSession {
       }
       final peer = _peerHello;
       final missing = _store.messagesMissingFrom(
-        _peerHas,
+        _peerMayHave,
         now: _now(),
         peerRelaysUnknown: peer?.relaysUnknown ?? false,
         cutoffCreatedAt: _peerCutoff,
@@ -377,7 +444,10 @@ class SyncSession {
 
   /// 相手の HELLO 直後に、公式の新着などを目録交換を待たずに送る（C08）。
   Future<void> _sendPush() async {
-    final candidates = _store.pushCandidates(now: _now());
+    final peerNode = peerNodeId;
+    final known = peerNode == null ? null : knownPeerIds?.call(peerNode);
+    final candidates =
+        _store.pushCandidates(now: _now(), skip: known ?? const <int>{});
     var bytes = 0;
     for (final m in candidates) {
       if (isFinished || _sentMessagesEnd) {
@@ -464,6 +534,8 @@ class SyncSession {
         _onInventory(frame);
       case FrameType.inventoryCutoff:
         _onInventoryCutoff(frame);
+      case FrameType.inventoryFilter:
+        _onInventoryFilter(frame);
       case FrameType.inventoryEnd:
         _onInventoryEnd();
       case FrameType.message:
@@ -507,9 +579,12 @@ class SyncSession {
     }
     onHello?.call(this);
     if (!isFinished && hello.acceptsPush) {
-      unawaited(_sendPush().catchError((Object e) {
+      _pushDone = _sendPush().catchError((Object e) {
         _logLine('先出しに失敗: $e');
-      }));
+      });
+    }
+    if (!_peerHelloReceived.isCompleted) {
+      _peerHelloReceived.complete();
     }
   }
 
@@ -533,6 +608,18 @@ class SyncSession {
       _peerHas.addAll(parseInventory(frame.payload));
     } on FrameFormatException catch (e) {
       _fail('不正な INVENTORY: ${e.message}');
+    }
+  }
+
+  void _onInventoryFilter(Frame frame) {
+    if (_state != SessionState.inventory) {
+      _fail('INVENTORY_FILTER の順序が不正');
+      return;
+    }
+    try {
+      _peerFilter = InventoryFilter.decode(frame.payload);
+    } on FormatException catch (e) {
+      _fail('不正な INVENTORY_FILTER: ${e.message}');
     }
   }
 
@@ -717,6 +804,9 @@ class SyncSession {
     _failureReason = reason;
     if (!_peerInventoryEnd.isCompleted) {
       _peerInventoryEnd.complete();
+    }
+    if (!_peerHelloReceived.isCompleted) {
+      _peerHelloReceived.complete();
     }
     if (!_startCompleter.isCompleted) {
       _startCompleter.complete();

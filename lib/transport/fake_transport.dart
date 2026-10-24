@@ -132,6 +132,9 @@ class _LinkEnd {
 
   /// LinkClosed を配送済み。
   bool closed = false;
+
+  /// このリンクで運んだバイト数（両方向の合計、[FakeRadio.linkByteLimit] 用）。
+  int carried = 0;
 }
 
 /// 複数の [FakeTransport] を結ぶ模擬電波。
@@ -153,6 +156,10 @@ class FakeRadio {
 
   /// 接続を指定の理由で断る peerId（ネイティブ側の「busy」などを模擬する）。
   final Map<String, String> failWith = <String, String>{};
+
+  /// 1 本のリンクで運べるバイト数（両方向の合計）。超えたら圏外になったとして
+  /// リンクを切る（短いすれ違いの模擬）。null なら無制限。
+  int? linkByteLimit;
 
   final Map<String, FakeTransport> _transports = <String, FakeTransport>{};
   final List<void Function()> _queue = <void Function()>[];
@@ -287,6 +294,15 @@ class FakeRadio {
   }
 
   void _send(_LinkEnd from, Uint8List data) {
+    final limit = linkByteLimit;
+    if (limit != null) {
+      from.carried += data.length;
+      from.peer.carried = from.carried;
+      if (from.carried > limit) {
+        _close(from, 'out_of_range');
+        return;
+      }
+    }
     final copy = Uint8List.fromList(data);
     bytesSent += copy.length;
     chunksSent++;
