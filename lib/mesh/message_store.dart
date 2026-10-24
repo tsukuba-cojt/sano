@@ -743,6 +743,16 @@ class MessageStore extends ChangeNotifier {
     return [for (var i = 0; i < n; i++) valid[i].msgId];
   }
 
+  /// [ids] に無い、中継できるメッセージがあるか（同期し直す必要があるかの判定）。
+  bool hasRelayableNotIn(Set<int> ids, {required int now}) {
+    for (final m in _messages.values) {
+      if (!ids.contains(m.msgId) && _isRelayable(m, now)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /// 目録を選ぶ。[small]（maxChunk が小さい）なら受信時刻の新しい順に
   /// [kSmallChunkInventoryLimit] 件へ絞り、最古の created_at を返す（C08）。
   InventorySelection inventorySelection({required int now, bool small = false}) {

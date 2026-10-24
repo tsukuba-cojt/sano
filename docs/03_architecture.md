@@ -115,6 +115,11 @@ MethodChannel: `jp.kairanban/ble`、EventChannel: `jp.kairanban/ble/events`。
 - iOS: `UIBackgroundModes = [bluetooth-central, bluetooth-peripheral]`。状態復元で再起動された場合、`AppDelegate` が Flutter エンジンを起動し、Dart が設定を読んで `start` → ネイティブはバッファしたイベントを流す。
   - 制約: iPhone 同士が両方とも画面消灯のバックグラウンドだと互いを発見できない（バックグラウンドの広告は overflow 領域に入り、バックグラウンドのスキャンはそれを拾えない。Apple が回避策なしと明言）。緩和策は 2 つ: (1) 既知ピアへの接続待ち（§3）— 一度つながった相手とは、両方とも画面消灯でも圏内に戻れば再接続して同期できる（20 分以内の再会に限る）。(2) Live Activity（§3）— iOS 26 では Live Activity を出している間、画面が点いていれば（ロック中でも）前面と同等にスキャンできる。Android が近くに 1 台あれば、Android は両方を発見できるので橋渡しされる。
 - Dart 側は `start` 済みかを `shared_preferences` の `mesh.enabled` に保存し、起動時に自動再開する。
+- **取りこぼし対策（v2.2、2026-10-24）**:
+  - iOS の状態復元起動（iOS がアプリを終了させたあと BLE の出来事で背面起動）ではシーンがつながらず暗黙のエンジンが作られないため、`AppDelegate` が画面なしの `FlutterEngine` を起動して `main()`（`implicitView` が無ければ `runApp` しない）と BleBridge を動かす。利用者が開いて暗黙のエンジンができたら画面なしのエンジンを止める（同じ保存ファイルを 2 つで触らない）。`BleEngine` は Dart の `start` を待たずに前回の動作設定（UserDefaults）で広告・スキャンを続け、受け口が無い間のイベントを溜めて `setEventHandler` で流す。
+  - iOS の背面では既知ピアへの接続待ちの出し直しを 60 秒 → 20 秒にし、バックグラウンドタスクで起きている間に出す（60 秒のタイマーは背面で止まるため）。前面のスキャンは重複を知らせる（`AllowDuplicates`、通知は 2 秒に 1 回へ間引く）。背面では BLE の出来事で起きたときにスキャンが 30 秒以上前ならかけ直し、近くの相手を知らせ直させる。前面・背面の切り替えでもかけ直す。サービスが無い相手の理由は `no_service` に統一（Dart はこのときだけ 15 分無視する）。
+  - Android は native の同時接続上限を 4 にして Dart（通常 2・中継役 3）の判断を断らない。API 33 未満では `connectGatt` に handler を渡さない（通知の値が上書きされて取りこぼすため）。BLE の出来事のたびに期限付きの部分ウェイクロック（発見 10 秒、リンク・受信 60 秒）を取り、画面オフでもタイマーが止まらないようにする（`WAKE_LOCK`）。peripheral 側は MTU の知らせが購読より後に来る端末のため最大 0.5 秒待ってから `linkOpened` を出し、その間の受信は溜める。central 側は切断前に購読を解除する（物理接続が残ったとき iPhone が次の書き込みを捨てないように）。接続を受けたあとの広告のかけ直しはしない（Android は広告を始め直すたびにアドレスが変わり、相手が別の端末と見て接続し続けるため。エミュレータで確認）。
+  - Mac は窓を閉じてもアプリを終了せず（Dock から開き直す）、動作中は App Nap を止める（`beginActivity`）。
 - **新しいお知らせの OS 通知**（docs/01 R-26、docs/08 C05）: `AppController` が `MessageStore` の変化を監視し、参加グループに新しく入った「自分の投稿でない未読の notice」を集める。起動時点でストアにあったもの・未参加グループのものは対象外。ハブ／テスト用トランスポートでは `NoopPlatformActions` が何もしない。（v2: C05）
   - **3 段階**（`NotificationLevel`）: 「ぜんぶ 知らせる」（all）／「公式と 大事なものだけ 知らせる」（important、既定）／「知らせない」（off）。v1 の 2 択は important / off に引き継ぐ。（v2: C05）
   - **重要度の決め方**（`NoticeImportance`、`AppController.importanceOf`）: 見出しが「【訓練】」なら normal。役割が公式・スタッフで種別が避難情報・注意喚起なら **urgent**。役割が公式・スタッフ、または種別固有の重要度が normal でない（避難情報・注意喚起・避難所・物資・給水・炊き出し・医療・救護。住民の避難情報はここに入る）なら **important**。残りは **normal**。設定 important のとき normal は通知しない（画面の「新しい お知らせが N 件」だけ）。role・category は署名がないため偽れる（docs/01 §5）。（v2: C05, C23）
@@ -131,6 +136,7 @@ MethodChannel: `jp.kairanban/ble`、EventChannel: `jp.kairanban/ble/events`。
 - `linkOpened` → `SyncSession` を生成（§4 of protocol）。
 - 送信は `Transport.send` を直列 await（フロー制御）。
 - 保存内容が変わったら `storeVersion++`、バックオフ表の「同期済み」を無効化。
+- **再接続の見直し**（v2.2）: 15 秒ごとのティックとセッション終了のたびに `_reconnectRecentPeers` で近くの相手（60 秒以内に見えた相手、または 1 度同期できて 2 × 再接続間隔 + 15 秒以内に見えた相手）を「未同期 → 最後の同期が古い → 電波が強い」順に見直す。同期の後に相手が持っているはずの msg_id（相手の目録 ∪ 渡した ∪ 受け取った）を node_id ごとに覚え、それに無い中継できるものが入ったら間隔内でもすぐ接続する（受け取ったものを別の相手へすぐ渡す）。打ち切り（MESSAGES_END bit0）は 2 秒後に続き、受信リンクでしか会えない相手（bit1）とは 20 秒間隔。ネイティブが自分で断った接続（`busy`・`duplicate`・`alreadyConnecting`・`not_running`・`poweredOff`）は失敗に数えない。Apple の背面広告由来の候補は 3 回続けて失敗したときだけ 15 分無視する。近くの端末数は HELLO の node_id でまとめて数え、30 分見ていない相手の記録は捨てる。
 - **中継役モード**（`MeshNode.setRelayMode`、docs/08 C04, C17）: HELLO の caps に bit1 を立て、参加グループ（`store.joinedGroupIds` の先頭 8 件）を末尾に載せる（私物端末は載せない）。central の同時リンク上限を 2 → 3 に広げる（`maxInitiatorLinks`）。自分が中継役で、前回の同期で相手も中継役だった node_id とは再接続間隔を 60 秒 → 10 秒に縮める（`store.version` が変われば待たないのは v1 と同じ）。セッション上限 1 MB（maxChunk < 180 なら 256 KB）・全体 300 秒への差し替えは `SyncSession` が両方の HELLO を見て転送開始前に行う。`AppSettings.relayMode` の変更は `AppController.saveSettings` が `setRelayMode` と `setKeepScreenOn` に反映する。（v2: C04, C17）
 - **時計の差**（docs/08 C12）: 各セッションが HELLO 直後の TIME から「相手の時計 − 自分の時計」を受け取り（`SyncSession.onPeerTime`）、`MeshNode` は直近 8 件の中央値を `clockOffsetSeconds` として公開する。1 時間を超えるずれは診断ログに残す。`AppController.clockLooksWrong` は「now が 0（2026 年より前）または中央値が 24 時間超」で、書く画面の警告に使う。（v2: C12）
 - **時刻の記録**（docs/08 C07, C18）: 同期が成功するたび `lastSyncAt`、MESSAGE を 1 件以上送ったら `lastSentAt`、受け取ったら `lastReceivedAt` を更新し、`totalMessagesSent` を足す。`onSyncCompleted(at, sent, received)` で `AppController` が `settings.lastSyncAt` を永続化し、中継役かつ「交換の 音」オンで送受どちらかが 1 件以上なら `playChime` を呼ぶ。（v2: C07, C04, C18）
@@ -154,3 +160,4 @@ MethodChannel: `jp.kairanban/ble`、EventChannel: `jp.kairanban/ble/events`。
 |---|---|---|
 | v1 | 2026-10-11 | 初版 |
 | v2 | 2026-10-21 | [08_use_cases.md](08_use_cases.md) の仕様変更を実装に合わせて反映。§2 モジュールの説明、§3 Platform Channel の追加メソッドと未実装時の方針、§4 通知 3 段階・月 1 回の確認通知・電池・画面点灯、§5 中継役モード・時計差・時刻の記録、§7 既知の制約を新設 |
+| v2.2 | 2026-10-24 | メッシュの取りこぼし対策（§4 iOS の画面なしエンジン・イベントの溜め置き・背面の再接続とスキャン、Android の上限・handler・ウェイクロック・MTU 待ち・購読解除、Mac の常駐、§5 再接続の見直し） |

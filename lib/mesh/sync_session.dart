@@ -92,9 +92,20 @@ class SyncSession {
     this.caps = kDefaultCaps,
     this.groupIds = const [],
     this.onPeerTime,
-  })  : maxChunk = maxChunk < 1 ? 1 : maxChunk,
-        _createTimer = createTimer ?? _realTimer,
-        _byteBudget = sessionByteBudget;
+    this.cannotReachPeer,
+  }) : maxChunk = maxChunk < 1 ? 1 : maxChunk,
+       _createTimer = createTimer ?? _realTimer,
+       _byteBudget = _budgetFor(sessionByteBudget, maxChunk);
+
+  /// 小さいチャンク（MTU の交渉に失敗した端末など）では 1 回の同期で送る量を
+  /// 減らし、30 秒以内に終えて続きは次の同期で送る（打ち切りの「続きあり」）。
+  static int _budgetFor(int budget, int maxChunk) {
+    if (maxChunk >= kSmallChunkThreshold) {
+      return budget;
+    }
+    final small = maxChunk * 256 < 4096 ? 4096 : maxChunk * 256;
+    return small < budget ? small : budget;
+  }
 
   final int linkId;
   final String peerId;
@@ -118,6 +129,10 @@ class SyncSession {
   /// この中で [abort] を呼んでもよい。
   final void Function(SyncSession session)? onHello;
 
+  /// 受け側（peripheral）が、相手に自分から接続できないか（HELLO 後に判定）。
+  /// true なら MESSAGES_END で「短い間隔で同期しに来てほしい」と伝える。
+  final bool Function(SyncSession session)? cannotReachPeer;
+
   /// 相手の TIME を受け取ったときに呼ばれる（相手の時計 − 自分の時計、秒）。
   final void Function(int offsetSeconds)? onPeerTime;
 
@@ -136,6 +151,9 @@ class SyncSession {
   final Set<int> _peerHas = <int>{};
   final Set<int> _pushed = <int>{};
   final List<int> _sentIds = <int>[];
+
+  /// 相手から MESSAGE で受け取った msg_id（新規・既知どちらも）。
+  final Set<int> _receivedIds = <int>{};
   final Completer<void> _doneCompleter = Completer<void>();
   final Completer<void> _startCompleter = Completer<void>();
   final Completer<void> _peerInventoryEnd = Completer<void>();
@@ -155,6 +173,8 @@ class SyncSession {
   bool _peerMessagesEnd = false;
   bool _closeRequested = false;
   bool _budgetExhausted = false;
+  bool _peerHasMore = false;
+  bool _peerWantsPoll = false;
   bool _relaxed = false;
   String? _failureReason;
   Timer? _helloTimer;
@@ -207,11 +227,24 @@ class SyncSession {
   /// 送った MESSAGE の msg_id（順）。
   List<int> get sentMessageIds => List.unmodifiable(_sentIds);
 
+  /// このセッションの後に相手が持っているはずの msg_id（相手の目録 ∪ 渡したもの
+  /// ∪ 受け取ったもの）。次に同期し直す必要があるかの判定に使う。
+  Set<int> get knownByPeer => <int>{..._peerHas, ..._sentIds, ..._receivedIds};
+
   /// 新規に保存できた受信 MESSAGE の件数。
   int get messagesReceived => _messagesReceived;
 
   /// バイト上限で送信を打ち切ったか。
   bool get budgetExhausted => _budgetExhausted;
+
+  /// 相手が送信上限で打ち切った（まだ渡すものがある）と知らせてきたか。
+  bool get peerHasMore => _peerHasMore;
+
+  /// 相手（受け側）がこちらへ接続できないので、短い間隔で同期しに来てほしいと言ったか。
+  bool get peerWantsPoll => _peerWantsPoll;
+
+  /// どちらかに渡しきれなかったものがある（すぐ続きの同期をする）。
+  bool get hasMore => _budgetExhausted || _peerHasMore;
 
   /// 正常終了したか（[done] 完了後に有効）。
   bool get succeeded => _state == SessionState.done;
@@ -309,7 +342,10 @@ class SyncSession {
       if (isFinished) {
         return;
       }
-      await _enqueueSend(Frame.messagesEnd().encode());
+      final pollMe = !initiator && (cannotReachPeer?.call(this) ?? false);
+      await _enqueueSend(
+        Frame.messagesEnd(more: _budgetExhausted, pollMe: pollMe).encode(),
+      );
       _sentMessagesEnd = true;
       _logLine('MESSAGE $_messagesSent 件を送信'
           '${_pushed.isNotEmpty ? '（先出し ${_pushed.length} 件）' : ''}');
@@ -433,6 +469,8 @@ class SyncSession {
       case FrameType.message:
         _onMessage(frame);
       case FrameType.messagesEnd:
+        _peerHasMore = Frame.messagesEndHasMore(frame.payload);
+        _peerWantsPoll = initiator && Frame.messagesEndPollMe(frame.payload);
         _onMessagesEnd();
       case FrameType.bye:
         _onBye();
@@ -539,8 +577,10 @@ class SyncSession {
       _logLine('不正な封筒を破棄: ${e.message}');
       return;
     }
-    final nextHop =
-        envelope.hop + 1 > kMaxHopValue ? kMaxHopValue : envelope.hop + 1;
+    _receivedIds.add(envelope.msgId);
+    final nextHop = envelope.hop + 1 > kMaxHopValue
+        ? kMaxHopValue
+        : envelope.hop + 1;
     final relayed = envelope.copyWith(hop: nextHop);
     _storeQueue = _storeQueue.then((_) async {
       try {

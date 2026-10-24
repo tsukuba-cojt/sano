@@ -31,6 +31,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.ParcelUuid
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import java.util.UUID
@@ -86,6 +87,11 @@ class BleEngine(context: Context, private val listener: Listener) {
         var connectTimeout: Runnable? = null
         var mtuFallback: Runnable? = null
         var closeFallback: Runnable? = null
+
+        /** peripheral 側: MTU の知らせを待ってから linkOpened を出す（その間の受信は溜める）。 */
+        var openPending = false
+        var openTimeout: Runnable? = null
+        val earlyData = ArrayList<ByteArray>()
     }
 
     private val appContext: Context = context.applicationContext
@@ -93,6 +99,19 @@ class BleEngine(context: Context, private val listener: Listener) {
     private val adapter: BluetoothAdapter? = manager?.adapter
     private val thread = HandlerThread("kairanban-ble").also { it.start() }
     private val handler = Handler(thread.looper)
+
+    /**
+     * 画面が消えている間も、接続・同期の途中で CPU が眠ってタイマー（接続・送信のタイムアウト、
+     * Dart の同期の見直し）が止まらないようにする部分ウェイクロック。BLE の出来事があるたびに
+     * 期限付きで取り直し、何も起きなければ期限で自動的に放す。
+     */
+    private val wakeLock: PowerManager.WakeLock? = try {
+        appContext.getSystemService(PowerManager::class.java)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "kairanban:ble")
+            ?.apply { setReferenceCounted(false) }
+    } catch (e: RuntimeException) {
+        null
+    }
 
     /** 端末が BLE に対応しているか。 */
     val isSupported: Boolean =
@@ -206,6 +225,7 @@ class BleEngine(context: Context, private val listener: Listener) {
             stopAdvertising()
             closeAllLinks("stopped")
             closeServer()
+            releaseWake()
             log("BLE を停止しました")
             publishState(force = true)
         }
@@ -414,6 +434,8 @@ class BleEngine(context: Context, private val listener: Listener) {
         val last = lastDiscovered[address]
         if (last != null && now - last < DISCOVER_DEDUP_MS) return
         lastDiscovered[address] = now
+        // Dart が接続を判断するまで CPU を起こしておく（画面オフでも接続が始められるように）。
+        keepAwake(WAKE_DISCOVERY_MS)
         emit("discovered", "peerId" to address, "rssi" to result.rssi, "viaApple" to viaApple)
     }
 
@@ -547,7 +569,9 @@ class BleEngine(context: Context, private val listener: Listener) {
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
             handler.post {
                 serverMtu[device.address] = mtu
-                serverLinks[device.address]?.mtu = mtu
+                val link = serverLinks[device.address] ?: return@post
+                link.mtu = mtu
+                if (link.openPending) openServerLink(link)
             }
         }
 
@@ -746,23 +770,47 @@ class BleEngine(context: Context, private val listener: Listener) {
             if (responseNeeded) server.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, value)
             return
         }
+        val knownMtu = serverMtu[address]
         val link = Link(nextLinkId++, address, initiator = false).apply {
             this.device = device
-            mtu = serverMtu[address] ?: DEFAULT_MTU
+            mtu = knownMtu ?: DEFAULT_MTU
             connected = true
             opened = true
         }
         links[link.id] = link
         serverLinks[address] = link
+        keepAwake(WAKE_LINK_MS)
         if (responseNeeded) server.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
-        log("リンク確立 #${link.id} $address（peripheral, MTU ${link.mtu}）")
+        if (knownMtu != null) {
+            openServerLink(link)
+        } else {
+            // MTU の知らせが購読より後に来る端末がある。少し待たないと、このリンクは
+            // 20 バイトずつの送受信になり、1 回の同期で渡せる量が大きく減る。
+            link.openPending = true
+            val timeout = Runnable { if (link.openPending && !link.finished) openServerLink(link) }
+            link.openTimeout = timeout
+            handler.postDelayed(timeout, SERVER_MTU_WAIT_MS)
+        }
+    }
+
+    /** peripheral 側のリンクを Dart に知らせ、待つ間に溜めた受信を流す。 */
+    private fun openServerLink(link: Link) {
+        if (link.finished) return
+        link.openPending = false
+        link.openTimeout?.let { handler.removeCallbacks(it) }
+        link.openTimeout = null
+        log("リンク確立 #${link.id} ${link.peerId}（peripheral, MTU ${link.mtu}）")
         emit(
             "linkOpened",
             "linkId" to link.id,
-            "peerId" to address,
+            "peerId" to link.peerId,
             "maxChunk" to link.mtu - 3,
             "initiator" to false,
         )
+        for (chunk in link.earlyData) {
+            emit("data", "linkId" to link.id, "data" to chunk)
+        }
+        link.earlyData.clear()
     }
 
     /** central からの RX 書き込み（受信チャンク）。 */
@@ -787,6 +835,11 @@ class BleEngine(context: Context, private val listener: Listener) {
         val link = serverLinks[device.address]
         if (link == null) {
             Log.d(TAG, "購読前の書き込みを破棄: ${device.address}")
+            return
+        }
+        keepAwake(WAKE_LINK_MS)
+        if (link.openPending) {
+            link.earlyData.add(value)
             return
         }
         emit("data", "linkId" to link.id, "data" to value)
@@ -922,6 +975,7 @@ class BleEngine(context: Context, private val listener: Listener) {
         }
         link.device = device
         links[link.id] = link
+        keepAwake(WAKE_LINK_MS)
         log("接続開始 #${link.id} $peerId")
         openGatt(link)
     }
@@ -942,7 +996,10 @@ class BleEngine(context: Context, private val listener: Listener) {
                 clientCallback,
                 BluetoothDevice.TRANSPORT_LE,
                 BluetoothDevice.PHY_LE_1M_MASK,
-                handler,
+                // API 33 未満では、通知の値を共有の characteristic に書いてから handler へ
+                // 投げるため、続けて届いた通知で値が上書きされて取りこぼす。handler を渡さず
+                // Binder スレッドで受けてすぐ複製し、runOnEngine でエンジンのスレッドへ移す。
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) handler else null,
             )
         } catch (e: RuntimeException) {
             Log.w(TAG, "connectGatt に失敗", e)
@@ -1116,6 +1173,7 @@ class BleEngine(context: Context, private val listener: Listener) {
         val link = gattLinks[gatt] ?: return
         if (!link.opened || link.finished) return
         if (characteristic.uuid != config?.txUuid) return
+        keepAwake(WAKE_LINK_MS)
         emit("data", "linkId" to link.id, "data" to value)
     }
 
@@ -1233,29 +1291,24 @@ class BleEngine(context: Context, private val listener: Listener) {
         link.connectTimeout = null
         link.mtuFallback?.let { handler.removeCallbacks(it) }
         link.mtuFallback = null
+        link.openTimeout?.let { handler.removeCallbacks(it) }
+        link.openTimeout = null
+        link.openPending = false
+        link.earlyData.clear()
         completeSend(link, "closed")
         links.remove(link.id)
 
         if (link.initiator) {
             val gatt = link.gatt
             if (gatt != null) {
-                try {
-                    gatt.disconnect()
-                } catch (e: RuntimeException) {
-                    Log.w(TAG, "disconnect に失敗", e)
-                }
-                if (link.connected) {
-                    // DISCONNECTED コールバックで close する。来なければ時間切れで close。
-                    val fallback = Runnable {
-                        if (gattLinks.remove(gatt) != null) closeGattQuietly(gatt)
-                        if (link.gatt === gatt) link.gatt = null
-                    }
-                    link.closeFallback = fallback
-                    handler.postDelayed(fallback, CLOSE_FALLBACK_MS)
+                // 物理接続が残ると、相手（特に iPhone）は購読が続いているとみなし、次の同期の
+                // 書き込みを捨てる。切る前に購読を解除する（届かなくても切断は続ける）。
+                val unsubscribed = link.opened && link.connected && reason != "disconnected" &&
+                    unsubscribeQuietly(gatt, link.tx)
+                if (unsubscribed) {
+                    handler.postDelayed({ disconnectGatt(link, gatt) }, UNSUBSCRIBE_DELAY_MS)
                 } else {
-                    gattLinks.remove(gatt)
-                    closeGattQuietly(gatt)
-                    link.gatt = null
+                    disconnectGatt(link, gatt)
                 }
             }
         } else {
@@ -1273,6 +1326,63 @@ class BleEngine(context: Context, private val listener: Listener) {
         }
         log("リンク終了 #${link.id} ${link.peerId} ($reason)")
         emitLinkClosed(link, reason)
+    }
+
+    private fun disconnectGatt(link: Link, gatt: BluetoothGatt) {
+        try {
+            gatt.disconnect()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "disconnect に失敗", e)
+        }
+        if (link.connected) {
+            // DISCONNECTED コールバックで close する。来なければ時間切れで close。
+            val fallback = Runnable {
+                if (gattLinks.remove(gatt) != null) closeGattQuietly(gatt)
+                if (link.gatt === gatt) link.gatt = null
+            }
+            link.closeFallback = fallback
+            handler.postDelayed(fallback, CLOSE_FALLBACK_MS)
+        } else {
+            gattLinks.remove(gatt)
+            closeGattQuietly(gatt)
+            link.gatt = null
+        }
+    }
+
+    /** TX の通知を止める（CCCD に 0 を書く）。書き込みを受け付けたら true。 */
+    private fun unsubscribeQuietly(gatt: BluetoothGatt, tx: BluetoothGattCharacteristic?): Boolean {
+        if (tx == null) return false
+        val cccd = tx.getDescriptor(CCCD_UUID) ?: return false
+        return try {
+            gatt.setCharacteristicNotification(tx, false)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(cccd, BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE) ==
+                    BluetoothStatusCodes.SUCCESS
+            } else {
+                writeDescriptorLegacy(gatt, cccd, BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)
+            }
+        } catch (e: RuntimeException) {
+            false
+        }
+    }
+
+    /** 期限付きでウェイクロックを取り直す（期限が来たら自動で放す）。 */
+    private fun keepAwake(ms: Long) {
+        val lock = wakeLock ?: return
+        try {
+            lock.acquire(ms)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "ウェイクロックを取れません", e)
+        }
+    }
+
+    private fun releaseWake() {
+        val lock = wakeLock ?: return
+        try {
+            if (lock.isHeld) lock.release()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "ウェイクロックを放せません", e)
+        }
     }
 
     private fun closeGattQuietly(gatt: BluetoothGatt) {
@@ -1329,12 +1439,17 @@ class BleEngine(context: Context, private val listener: Listener) {
         private const val APPLE_OVERFLOW_TYPE: Byte = 0x01
         private const val DEFAULT_MTU = 23
         private const val REQUEST_MTU = 517
-        private const val MAX_OUTGOING = 2
+        // Dart 側の上限（通常 2、中継役 3）より大きくして、Dart の判断を native が断らないようにする。
+        private const val MAX_OUTGOING = 4
         private const val MAX_INCOMING = 4
         private const val CONNECT_TIMEOUT_MS = 10_000L
         private const val MTU_TIMEOUT_MS = 2_000L
         private const val SEND_TIMEOUT_MS = 5_000L
         private const val CLOSE_FALLBACK_MS = 2_000L
+        private const val SERVER_MTU_WAIT_MS = 500L
+        private const val UNSUBSCRIBE_DELAY_MS = 150L
+        private const val WAKE_DISCOVERY_MS = 10_000L
+        private const val WAKE_LINK_MS = 60_000L
         private const val RETRY_133_DELAY_MS = 500L
         private const val WRITE_RETRY_DELAY_MS = 8L
         private const val MAX_WRITE_ATTEMPTS = 600

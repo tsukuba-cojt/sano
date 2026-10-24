@@ -24,6 +24,8 @@ class MainFlutterWindow: NSWindow {
     bleEngine = engine
     bleBridge = BleBridge(messenger: flutterViewController.engine.binaryMessenger, engine: engine)
 
+    // 閉じても解放しない（アプリは動き続け、Dock から開き直す）。
+    isReleasedWhenClosed = false
     contentMinSize = MainFlutterWindow.minimumContentSize
     setContentSize(MainFlutterWindow.defaultContentSize)
     center()

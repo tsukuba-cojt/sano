@@ -151,6 +151,9 @@ class FakeRadio {
   /// 到達不能として扱う peerId（接続失敗を模擬する）。
   final Set<String> unreachable = <String>{};
 
+  /// 接続を指定の理由で断る peerId（ネイティブ側の「busy」などを模擬する）。
+  final Map<String, String> failWith = <String, String>{};
+
   final Map<String, FakeTransport> _transports = <String, FakeTransport>{};
   final List<void Function()> _queue = <void Function()>[];
   bool _draining = false;
@@ -245,8 +248,10 @@ class FakeRadio {
       if (!from.running) {
         return;
       }
-      String? failure;
-      if (target == null) {
+      String? failure = failWith[targetId];
+      if (failure != null) {
+        // そのまま下で linkClosed にする。
+      } else if (target == null) {
         failure = 'service_not_found';
       } else if (!target.running || unreachable.contains(targetId)) {
         failure = 'timeout';

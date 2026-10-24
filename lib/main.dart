@@ -20,5 +20,11 @@ Future<void> main() async {
     runApp(KairanStartupErrorApp(message: '$e'));
     return;
   }
+  // iOS の Bluetooth によるバックグラウンド起動（画面なしのエンジン）では描く先が無い。
+  // すれ違いの同期は controller が動かすので、画面は作らない。
+  if (WidgetsBinding.instance.platformDispatcher.implicitView == null) {
+    debugPrint('画面なしで起動しました（すれ違い通信だけ動かします）');
+    return;
+  }
   runApp(KairanApp(controller));
 }

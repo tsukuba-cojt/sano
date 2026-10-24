@@ -49,7 +49,7 @@ final class BleBridge: NSObject, FlutterStreamHandler {
       self?.handle(call, result: result)
     }
     eventChannel.setStreamHandler(self)
-    engine.onEvent = { [weak self] event in
+    engine.setEventHandler { [weak self] event in
       let map = BleBridge.encode(event)
       DispatchQueue.main.async { self?.deliver(map) }
     }

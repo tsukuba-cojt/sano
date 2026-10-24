@@ -7,6 +7,7 @@ import 'package:kairanban/core/envelope.dart';
 import 'package:kairanban/core/epoch.dart';
 import 'package:kairanban/core/ids.dart';
 import 'package:kairanban/mesh/groups.dart';
+import 'package:kairanban/mesh/mesh_node.dart';
 import 'package:kairanban/mesh/store_file.dart';
 import 'package:kairanban/transport/fake_transport.dart';
 
@@ -492,11 +493,16 @@ void main() {
     // お知らせが届く。
     await radio.elapse(const Duration(minutes: 2));
     await a.postNotice(
-        groupCode: g.code, category: NoticeCategory.water, title: '給水します');
+      groupCode: g.code,
+      category: NoticeCategory.water,
+      title: '給水します',
+    );
+    // B は直前に A と同期し直しているので、次の同期（60 秒間隔）で受け取る。
     radio.discover('B', 'A');
-    await radio.settle();
+    await radio.elapse(
+      const Duration(seconds: kResyncIntervalSeconds + kMeshTickSeconds),
+    );
     expect(b.store.count, 2);
-    await radio.elapse(const Duration(seconds: 5));
     expect(platform.shown.length, 1);
     expect(platform.shown.single.title, '給水します');
     // 公式の発信元名はグループ名（C09）。場所も本文もないので「〜 から」。
@@ -680,7 +686,9 @@ void main() {
     await a.postNotice(
         groupCode: g.code, category: NoticeCategory.food, title: '炊き出し');
     radio.discover('B', 'A');
-    await radio.settle();
+    await radio.elapse(
+      const Duration(seconds: kResyncIntervalSeconds + kMeshTickSeconds),
+    );
     expect(b.store.count, 3);
     expect(received.length, 2);
     expect(received.last.isAfter(received.first), isTrue);

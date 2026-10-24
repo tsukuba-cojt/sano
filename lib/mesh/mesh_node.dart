@@ -41,6 +41,19 @@ const int kRecentLogLines = 100;
 /// 時計のずれの判定に使う直近の TIME の件数。
 const int kClockSamples = 8;
 
+/// 近くの端末と同期し直せるかを見直す間隔。発見の通知が繰り返し来ない環境
+/// （iOS の背面など）や、同時接続の上限で後回しにした相手にも広げるため。
+const int kMeshTickSeconds = 15;
+
+/// 見かけなくなった端末の記録を忘れるまでの秒数。
+const int kForgetPeerSeconds = 30 * 60;
+
+/// 相手がこちらへ接続できない（受信リンクでしか会えない）ときの再同期間隔。
+const int kPollIntervalSeconds = 20;
+
+/// 送信上限で打ち切った同期の続きを始めるまでの秒数。
+const int kContinueDelaySeconds = 2;
+
 /// 接続要求が応答なしのまま放置されたとみなす秒数（スロット解放用）。
 const int _stalePendingConnectSeconds = 30;
 
@@ -89,12 +102,30 @@ class PeerRecord {
 }
 
 class _NodeSync {
-  _NodeSync({required this.lastSyncAt, required this.version, this.relay = false});
+  _NodeSync({
+    required this.lastSyncAt,
+    required this.known,
+    this.relay = false,
+    this.more = false,
+    this.poll = false,
+  });
   final int lastSyncAt;
-  final int version;
+
+  /// 同期の後に相手が持っているはずの msg_id。
+  final Set<int> known;
+
+  /// [_hasNewFor] の結果の覚え（store.version が同じ間は再計算しない）。
+  int? checkedVersion;
+  bool hasNew = false;
 
   /// 相手が中継役だったか（中継役どうしは短い間隔で再接続する）。
   final bool relay;
+
+  /// どちらかが送信上限で打ち切った（すぐ続きを同期する）。
+  final bool more;
+
+  /// 相手がこちらへ接続できない（短い間隔で同期しに行く）。
+  final bool poll;
 }
 
 /// メッシュノード。トランスポートのイベントを購読し、同期セッションを管理する。
@@ -153,6 +184,8 @@ class MeshNode extends ChangeNotifier {
   final Queue<int> _clockOffsets = Queue<int>();
 
   bool _running = false;
+  Timer? _tickTimer;
+  bool _disposed = false;
   bool _lowPower = false;
   bool _relayMode = false;
   bool _poweredOn = false;
@@ -186,12 +219,17 @@ class MeshNode extends ChangeNotifier {
   /// HELLO に載せる能力ビット。
   int get caps => kDefaultCaps | (_relayMode ? kCapRelayNode : 0);
 
-  /// 直近 60 秒に見えた端末数。
+  /// 直近 60 秒に見えた端末数。同じ端末がアドレスを変えて見えても 1 台と数える
+  /// （HELLO で分かったノード ID でまとめる）。
   int get nearbyCount {
     final t = _now();
-    return _peers.values
-        .where((p) => t - p.lastSeen <= kNearbyWindowSeconds)
-        .length;
+    final seen = <String>{};
+    for (final p in _peers.values) {
+      if (t - p.lastSeen <= kNearbyWindowSeconds) {
+        seen.add(p.nodeIdHex ?? 'peer:${p.peerId}');
+      }
+    }
+    return seen.length;
   }
 
   int get activeSessions => _sessions.length;
@@ -259,8 +297,11 @@ class MeshNode extends ChangeNotifier {
     }
     _running = true;
     _startedAt = _now();
-    _logLine('開始 node=$_nodeIdHex${lowPower ? ' (省電力)' : ''}'
-        '${_relayMode ? ' (中継役)' : ''}');
+    _armTick();
+    _logLine(
+      '開始 node=$_nodeIdHex${lowPower ? ' (省電力)' : ''}'
+      '${_relayMode ? ' (中継役)' : ''}',
+    );
     notifyListeners();
   }
 
@@ -269,6 +310,8 @@ class MeshNode extends ChangeNotifier {
       return;
     }
     _running = false;
+    _tickTimer?.cancel();
+    _tickTimer = null;
     for (final s in _sessions.values.toList()) {
       _abortedByNode.add(s);
       s.abort('停止');
@@ -303,9 +346,35 @@ class MeshNode extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _tickTimer?.cancel();
+    _tickTimer = null;
     _subscription?.cancel();
     _subscription = null;
     super.dispose();
+  }
+
+  void _armTick() {
+    _tickTimer?.cancel();
+    final create = _createTimer ?? Timer.new;
+    _tickTimer = create(const Duration(seconds: kMeshTickSeconds), _onTick);
+  }
+
+  void _onTick() {
+    _tickTimer = null;
+    if (!_running || _disposed) {
+      return;
+    }
+    // 1 時間以上同期していない相手の記録は捨てる（メモリを増やし続けない）。
+    final t = _now();
+    _nodeSync.removeWhere((_, v) => t - v.lastSyncAt > 3600);
+    // アドレスが変わるたびに記録が増えるので、30 分見ていない相手は忘れる。
+    _peers.removeWhere((id, p) =>
+        t - p.lastSeen > kForgetPeerSeconds &&
+        !_pendingConnects.containsKey(id) &&
+        !_sessions.values.any((s) => s.peerId == id));
+    _reconnectRecentPeers();
+    _armTick();
   }
 
   // ---------------------------------------------------------------------------
@@ -325,17 +394,47 @@ class MeshNode extends ChangeNotifier {
     return result;
   }
 
+  /// 一度同期できた相手に、発見の通知が来なくても同期し直しを試みる秒数。
+  /// iOS の背面では同じ相手の発見が繰り返し通知されないため、近くに居続ける
+  /// 相手とも定期的に同期し直せるようにする（離れた相手には 1〜2 回失敗するだけ）。
+  int get _lingerWindowSeconds => resyncIntervalSeconds * 2 + kMeshTickSeconds;
+
+  /// 近くの端末へ、まだ渡していない（または相手から受け取れる）ものがあれば接続する。
+  /// まだ同期していない相手 → 最後の同期が古い相手 → 電波の強い相手の順。
   void _reconnectRecentPeers() {
-    if (!_running) {
+    if (!_running || _disposed) {
       return;
     }
     final t = _now();
-    for (final p in _peers.values) {
-      // 受信リンクでしか見ていない相手（central 側のランダムアドレス）には
-      // 接続できないので、広告で発見した相手だけに再接続する。
-      if (p.lastDiscoveredAt != null && t - p.lastSeen <= kNearbyWindowSeconds) {
-        _maybeConnect(p);
+    final candidates =
+        _peers.values.where((p) {
+          // 受信リンクでしか見ていない相手（central 側のランダムアドレス）には
+          // 接続できないので、広告で発見した相手だけに再接続する。
+          if (p.lastDiscoveredAt == null) {
+            return false;
+          }
+          final age = t - p.lastSeen;
+          if (age <= kNearbyWindowSeconds) {
+            return true;
+          }
+          return p.lastSyncAt != null && age <= _lingerWindowSeconds;
+        }).toList()..sort((a, b) {
+          final sa = a.lastSyncAt;
+          final sb = b.lastSyncAt;
+          if (sa == null || sb == null) {
+            if (sa != sb) {
+              return sa == null ? -1 : 1;
+            }
+          } else if (sa != sb) {
+            return sa.compareTo(sb);
+          }
+          return b.rssi.compareTo(a.rssi);
+        });
+    for (final p in candidates) {
+      if (_initiatorCount >= maxInitiatorLinks) {
+        break;
       }
+      _maybeConnect(p);
     }
   }
 
@@ -421,11 +520,21 @@ class MeshNode extends ChangeNotifier {
       }
       final sync = _nodeSync[hex];
       if (sync != null) {
-        final interval = (sync.relay && _relayMode)
-            ? kRelayResyncIntervalSeconds
-            : resyncIntervalSeconds;
-        if (t - sync.lastSyncAt < interval && sync.version == _store.version) {
-          return;
+        if (sync.more) {
+          if (t - sync.lastSyncAt < kContinueDelaySeconds) {
+            return;
+          }
+        } else {
+          var interval = (sync.relay && _relayMode)
+              ? kRelayResyncIntervalSeconds
+              : resyncIntervalSeconds;
+          if (sync.poll && interval > kPollIntervalSeconds) {
+            interval = kPollIntervalSeconds;
+          }
+          // 間隔内でも、相手がまだ持っていないものが入っていればすぐ渡す。
+          if (t - sync.lastSyncAt < interval && !_hasNewFor(sync, t)) {
+            return;
+          }
         }
       }
     }
@@ -441,12 +550,51 @@ class MeshNode extends ChangeNotifier {
     });
   }
 
+  /// 前回の同期の後に、相手がまだ持っていない中継できるものが入ったか。
+  bool _hasNewFor(_NodeSync sync, int now) {
+    final v = _store.version;
+    if (sync.checkedVersion != v) {
+      sync.checkedVersion = v;
+      sync.hasNew = _store.hasRelayableNotIn(sync.known, now: now);
+    }
+    return sync.hasNew;
+  }
+
+  /// ネイティブ側が自分で断った（接続を試していない）理由。失敗に数えない。
+  static const Set<String> _notAttemptedReasons = {
+    'busy',
+    'duplicate',
+    'alreadyConnecting',
+    'not_running',
+    'poweredOff',
+  };
+
+  /// 相手に回覧板のサービスが無いと確かめられた理由。
+  static const Set<String> _noServiceReasons = {
+    'no_service',
+    'service_not_found',
+    'serviceNotFound',
+  };
+
+  /// Apple の背面広告から見つけた候補が、サービス未確認のまま続けて失敗したら無視する回数。
+  static const int _appleFailuresBeforeIgnore = 3;
+
   void _onConnectFailed(PeerRecord p, String reason) {
     _pendingConnects.remove(p.peerId);
-    p.failures++;
     final t = _now();
-    final noService = reason.toLowerCase().contains('service');
-    if ((p.viaApple && !p.serviceConfirmed) || noService) {
+    if (_notAttemptedReasons.contains(reason)) {
+      // 接続の枠や状態の都合で断っただけ。次の見直しでまた試す。
+      _logLine('接続を見送り ${p.peerId}: $reason');
+      notifyListeners();
+      return;
+    }
+    p.failures++;
+    final noService = _noServiceReasons.contains(reason);
+    final appleGiveUp =
+        p.viaApple &&
+        !p.serviceConfirmed &&
+        p.failures >= _appleFailuresBeforeIgnore;
+    if (noService || appleGiveUp) {
       p.ignoreUntil = t + appleIgnoreSeconds;
       _logLine('接続失敗 ${p.peerId}（サービスなし、$appleIgnoreSeconds 秒無視）: $reason');
     } else {
@@ -493,6 +641,7 @@ class MeshNode extends ChangeNotifier {
       caps: caps,
       groupIds: groupIds,
       onPeerTime: _onPeerTime,
+      cannotReachPeer: _cannotReach,
     );
     _sessions[e.linkId] = session;
     _totalSessions++;
@@ -501,6 +650,22 @@ class MeshNode extends ChangeNotifier {
     unawaited(session.done.then((_) => _onSessionDone(session, p)));
     unawaited(session.start());
     notifyListeners();
+  }
+
+  /// HELLO で分かった相手に、こちらから接続できないか（広告で見つけた記録がない）。
+  bool _cannotReach(SyncSession session) {
+    final peerNode = session.peerNodeId;
+    if (peerNode == null) {
+      return false;
+    }
+    final hex = hexOf(peerNode);
+    final t = _now();
+    return !_peers.values.any(
+      (p) =>
+          p.nodeIdHex == hex &&
+          p.lastDiscoveredAt != null &&
+          t - p.lastSeen <= _lingerWindowSeconds,
+    );
   }
 
   void _onPeerTime(int offsetSeconds) {
@@ -571,16 +736,31 @@ class MeshNode extends ChangeNotifier {
     if (session.succeeded) {
       p.failures = 0;
       p.lastSyncAt = t;
+      p.lastSeen = t;
       p.lastSyncedVersion = _store.version;
       p.backoffUntil = 0;
       _lastSyncAt = t;
       if (hex != null) {
         _nodeSync[hex] = _NodeSync(
-            lastSyncAt: t, version: _store.version, relay: session.peerIsRelay);
+          lastSyncAt: t,
+          known: session.knownByPeer,
+          relay: session.peerIsRelay,
+          more: session.hasMore,
+          poll: session.peerWantsPoll,
+        );
       }
-      _logLine('同期完了 ${p.peerId} 受信 ${session.messagesReceived} 件 '
-          '送信 ${session.messagesSent} 件');
+      _logLine(
+        '同期完了 ${p.peerId} 受信 ${session.messagesReceived} 件 '
+        '送信 ${session.messagesSent} 件${session.hasMore ? '（続きあり）' : ''}',
+      );
       onSyncCompleted?.call(t, session.messagesSent, session.messagesReceived);
+      if (session.hasMore) {
+        // 打ち切った続きを少し待って同期する（相手が接続してくる場合もある）。
+        (_createTimer ?? Timer.new)(
+          const Duration(seconds: kContinueDelaySeconds),
+          _reconnectRecentPeers,
+        );
+      }
     } else if (!_abortedByNode.remove(session)) {
       // 同じ相手と別のセッションが進行中／直前に成功している場合は、
       // 相手側が重複リンクを閉じただけなので失敗に数えない。
@@ -597,6 +777,9 @@ class MeshNode extends ChangeNotifier {
       }
       _logLine('同期失敗 ${p.peerId}: ${session.failureReason ?? ''}');
     }
+    // 接続の枠が空いた。受け取ったものがあれば近くの別の端末へすぐ渡し、
+    // 上限で後回しにした相手とも同期する。
+    _reconnectRecentPeers();
     notifyListeners();
   }
 

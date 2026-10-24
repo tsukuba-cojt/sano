@@ -39,6 +39,13 @@ const int kCapGroupList = 0x04;
 /// HELLO caps bit3: HELLO 直後の先出し（PUSH）を受けられる（C08）。
 const int kCapPush = 0x08;
 
+/// MESSAGES_END payload bit0: 送信上限で打ち切った（続きがある）。
+const int kMessagesEndMore = 0x01;
+
+/// MESSAGES_END payload bit1: こちらからは接続できない（広告で見つけられていない）
+/// ので、近くにいる間は短い間隔で同期しに来てほしい。受け側（peripheral）だけが立てる。
+const int kMessagesEndPollMe = 0x02;
+
 /// この実装が常に立てる caps。
 const int kDefaultCaps = kCapRelayUnknown | kCapPush;
 
@@ -193,7 +200,24 @@ class Frame {
   static Frame message(Uint8List envelopeBytes) =>
       Frame(FrameType.message.code, envelopeBytes);
 
-  static Frame messagesEnd() => Frame(FrameType.messagesEnd.code, Uint8List(0));
+  /// MESSAGES_END。[more] なら payload に 1 バイト（bit0 = 送信上限で打ち切った、
+  /// まだ渡すものがある）を載せる。旧版は payload を読まないので互換がある。
+  static Frame messagesEnd({bool more = false, bool pollMe = false}) {
+    final flags =
+        (more ? kMessagesEndMore : 0) | (pollMe ? kMessagesEndPollMe : 0);
+    return Frame(
+      FrameType.messagesEnd.code,
+      flags == 0 ? Uint8List(0) : Uint8List.fromList([flags]),
+    );
+  }
+
+  /// MESSAGES_END の payload が「まだ渡すものがある」か。
+  static bool messagesEndHasMore(Uint8List payload) =>
+      payload.isNotEmpty && (payload[0] & kMessagesEndMore) != 0;
+
+  /// MESSAGES_END の payload が「短い間隔で同期しに来てほしい」か。
+  static bool messagesEndPollMe(Uint8List payload) =>
+      payload.isNotEmpty && (payload[0] & kMessagesEndPollMe) != 0;
 
   static Frame bye() => Frame(FrameType.bye.code, Uint8List(0));
 

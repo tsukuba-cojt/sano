@@ -58,6 +58,20 @@ final class BleEngine: NSObject {
   /// 切断後に接続待ちを出し直すまでの間隔。Dart 側の再同期間隔（60 秒）に合わせ、
   /// 圏内に居続ける相手と数秒おきに接続と切断を繰り返さないようにする。
   private static let knownPeerReconnectDelay: TimeInterval = 60
+  /// 背面のときの接続待ちの出し直し間隔。背面のアプリは最後の BLE イベントから約 10 秒で
+  /// 止まるため、バックグラウンドタスクで延ばせる範囲（約 30 秒）に収める。
+  private static let backgroundReconnectDelay: TimeInterval = 20
+  /// 背面でスキャンをかけ直す間隔。背面のスキャンは同じ相手を 1 回しか知らせないので、
+  /// BLE イベントで起きたときに古ければかけ直し、近くにいる相手を知らせ直させる。
+  private static let backgroundScanRefresh: TimeInterval = 30
+  /// Dart の start が届く前（状態復元の起動）にも動き続けるための保存キー。
+  private static let savedRunningKey = "jp.kairanban.ble.running"
+  private static let savedLowPowerKey = "jp.kairanban.ble.lowPower"
+  private static let savedServiceKey = "jp.kairanban.ble.service"
+  private static let savedRxKey = "jp.kairanban.ble.rx"
+  private static let savedTxKey = "jp.kairanban.ble.tx"
+  /// Dart がまだ受け取れないときに溜めておくイベントの上限。
+  private static let pendingEventLimit = 1024
 
   // MARK: - 状態
 
@@ -69,8 +83,19 @@ final class BleEngine: NSObject {
     let running: Bool
   }
 
-  /// イベント受け取り口。`queue` 上で呼ばれる。
-  var onEvent: ((BleEvent) -> Void)?
+  /// イベント受け取り口。`queue` 上で呼ばれる。[setEventHandler] で設定する。
+  private var onEvent: ((BleEvent) -> Void)?
+
+  /// 受け取り口が無い間（状態復元で Flutter より先に動いたとき）のイベント。
+  private var pendingEvents: [BleEvent] = []
+
+  /// 最後にスキャンを始めた時刻。
+  private var lastScanStart: Date?
+
+  #if os(macOS)
+  /// App Nap でタイマーが間引かれないようにする（動作中だけ）。
+  private var activity: NSObjectProtocol?
+  #endif
 
   /// 両マネージャ共通の直列キュー。
   let queue = DispatchQueue(label: "jp.kairanban.ble")
@@ -208,7 +233,12 @@ final class BleEngine: NSObject {
     // 初回は オンボーディングからの requestPermissions まで待つ。
     // 復元起動、または権限が決まっている場合は didFinishLaunching 中に作る（状態復元の条件）。
     if restoring || CBManager.authorization != .notDetermined {
-      queue.sync { ensureManagersOnQueue() }
+      queue.sync {
+        if restoring {
+          restoreSavedRunningOnQueue()
+        }
+        ensureManagersOnQueue()
+      }
     }
     #if os(iOS)
     inForeground = UIApplication.shared.applicationState == .active
@@ -227,6 +257,8 @@ final class BleEngine: NSObject {
     queue.async {
       self.inForeground = true
       self.updateDutyCycle()
+      // 前面では同じ相手を繰り返し知らせるスキャンに切り替える
+      self.restartScan(reason: "前面")
     }
   }
 
@@ -234,9 +266,45 @@ final class BleEngine: NSObject {
     queue.async {
       self.inForeground = false
       self.updateDutyCycle()
+      self.restartScan(reason: "背面")
     }
   }
   #endif
+
+  /// 状態復元の起動で、前回 Dart が start したままなら、その設定で動き続ける
+  /// （Dart の start を待たずに広告・スキャン・接続待ちを止めない）。
+  private func restoreSavedRunningOnQueue() {
+    let defaults = UserDefaults.standard
+    guard defaults.bool(forKey: BleEngine.savedRunningKey) else { return }
+    if let s = defaults.string(forKey: BleEngine.savedServiceKey) { serviceUUID = CBUUID(string: s) }
+    if let s = defaults.string(forKey: BleEngine.savedRxKey) { rxUUID = CBUUID(string: s) }
+    if let s = defaults.string(forKey: BleEngine.savedTxKey) { txUUID = CBUUID(string: s) }
+    lowPower = defaults.bool(forKey: BleEngine.savedLowPowerKey)
+    running = true
+    logger.info("復元起動: 前回の動作中の設定で続ける")
+  }
+
+  private func saveRunning() {
+    let defaults = UserDefaults.standard
+    defaults.set(running, forKey: BleEngine.savedRunningKey)
+    defaults.set(lowPower, forKey: BleEngine.savedLowPowerKey)
+    defaults.set(serviceUUID.uuidString, forKey: BleEngine.savedServiceKey)
+    defaults.set(rxUUID.uuidString, forKey: BleEngine.savedRxKey)
+    defaults.set(txUUID.uuidString, forKey: BleEngine.savedTxKey)
+  }
+
+  /// イベントの受け取り口を設定する（どのスレッドからでもよい）。溜まっていたイベントを流す。
+  func setEventHandler(_ handler: ((BleEvent) -> Void)?) {
+    queue.async {
+      self.onEvent = handler
+      guard let handler = handler, !self.pendingEvents.isEmpty else { return }
+      let events = self.pendingEvents
+      self.pendingEvents.removeAll()
+      for event in events {
+        handler(event)
+      }
+    }
+  }
 
   // MARK: - 公開 API（任意のスレッド）
 
@@ -274,6 +342,14 @@ final class BleEngine: NSObject {
         return
       }
       self.running = true
+      self.saveRunning()
+      #if os(macOS)
+      if self.activity == nil {
+        self.activity = ProcessInfo.processInfo.beginActivity(
+          options: [.userInitiatedAllowingIdleSystemSleep],
+          reason: "回覧板のすれ違い通信")
+      }
+      #endif
       self.ensureManagersOnQueue()
       self.updateScanning()
       self.updateDutyCycle()
@@ -335,6 +411,24 @@ final class BleEngine: NSObject {
       scanPaused = false
       updateScanning()
     }
+  }
+
+  /// スキャンをかけ直す（重複の設定を変える・近くの相手を知らせ直させる）。
+  private func restartScan(reason: String) {
+    guard scanning, let central = central, central.state == .poweredOn else { return }
+    central.stopScan()
+    scanning = false
+    log("scan: かけ直し（\(reason)）")
+    updateScanning()
+  }
+
+  /// 背面で BLE イベントにより起きたとき、スキャンが古ければかけ直す。
+  private func refreshScanIfStale() {
+    guard running, !inForeground, scanning else { return }
+    if let last = lastScanStart, Date().timeIntervalSince(last) < BleEngine.backgroundScanRefresh {
+      return
+    }
+    restartScan(reason: "背面の知らせ直し")
   }
 
   /// `peerId` へ接続する。結果は linkOpened / linkClosed で通知する。
@@ -420,7 +514,15 @@ final class BleEngine: NSObject {
   }
 
   private func emit(_ event: BleEvent) {
-    onEvent?(event)
+    if let handler = onEvent {
+      handler(event)
+      return
+    }
+    if case .log = event { return }
+    pendingEvents.append(event)
+    if pendingEvents.count > BleEngine.pendingEventLimit {
+      pendingEvents.removeFirst(pendingEvents.count - BleEngine.pendingEventLimit)
+    }
   }
 
   private func emitState() {
@@ -440,6 +542,15 @@ final class BleEngine: NSObject {
   private func stopOnQueue() {
     let wasRunning = running
     running = false
+    if wasRunning {
+      saveRunning()
+    }
+    #if os(macOS)
+    if let activity = activity {
+      ProcessInfo.processInfo.endActivity(activity)
+      self.activity = nil
+    }
+    #endif
     dutyTimer?.cancel()
     dutyTimer = nil
     scanPaused = false
@@ -484,10 +595,13 @@ final class BleEngine: NSObject {
     guard let central = central else { return }
     let shouldScan = running && central.state == .poweredOn && !scanPaused
     if shouldScan && !scanning {
+      // 前面では同じ相手を繰り返し知らせる（間引きは didDiscover の 2 秒）。背面では OS が
+      // 重複を落とすので false（かけ直しは refreshScanIfStale）。
       central.scanForPeripherals(
         withServices: [serviceUUID],
-        options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        options: [CBCentralManagerScanOptionAllowDuplicatesKey: inForeground])
       scanning = true
+      lastScanStart = Date()
       log("scan: 開始")
     } else if !shouldScan && scanning {
       if central.state == .poweredOn {
@@ -679,12 +793,34 @@ final class BleEngine: NSObject {
   private func scheduleReconnect(_ id: UUID) {
     guard let peer = knownPeers[id] else { return }
     peer.reconnectTimer?.cancel()
+    var delay = BleEngine.knownPeerReconnectDelay
+    #if os(iOS)
+    // 背面ではアプリがすぐ止まり 60 秒のタイマーが動かないので、バックグラウンドタスクで
+    // 起きている間（約 30 秒）に収まる間隔で出し直す。
+    var task = UIBackgroundTaskIdentifier.invalid
+    if !inForeground {
+      delay = BleEngine.backgroundReconnectDelay
+      task = UIApplication.shared.beginBackgroundTask(withName: "jp.kairanban.reconnect") {
+        if task != .invalid {
+          UIApplication.shared.endBackgroundTask(task)
+          task = .invalid
+        }
+      }
+    }
+    #endif
     let timer = DispatchSource.makeTimerSource(queue: queue)
-    timer.schedule(deadline: .now() + BleEngine.knownPeerReconnectDelay)
+    timer.schedule(deadline: .now() + delay)
     timer.setEventHandler { [weak self] in
-      guard let self = self else { return }
-      self.knownPeers[id]?.reconnectTimer = nil
-      self.ensurePendingConnect(id)
+      if let self = self {
+        self.knownPeers[id]?.reconnectTimer = nil
+        self.ensurePendingConnect(id)
+      }
+      #if os(iOS)
+      if task != .invalid {
+        UIApplication.shared.endBackgroundTask(task)
+        task = .invalid
+      }
+      #endif
     }
     timer.resume()
     peer.reconnectTimer = timer
@@ -881,6 +1017,7 @@ extension BleEngine: CBCentralManagerDelegate {
   }
 
   func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+    refreshScanIfStale()
     let id = peripheral.identifier
     if let link = centralLinks[id] {
       log("connected: link=\(link.linkId)")
@@ -925,6 +1062,7 @@ extension BleEngine: CBCentralManagerDelegate {
   }
 
   private func handleDisconnect(_ peripheral: CBPeripheral, error: Error?, systemReconnecting: Bool) {
+    refreshScanIfStale()
     let id = peripheral.identifier
     if let link = centralLinks[id] {
       if let error = error {
@@ -953,7 +1091,7 @@ extension BleEngine: CBPeripheralDelegate {
       return
     }
     guard let found = peripheral.services?.first(where: { $0.uuid == serviceUUID }) else {
-      closeCentralLink(link, reason: "serviceNotFound")
+      closeCentralLink(link, reason: "no_service")
       return
     }
     peripheral.discoverCharacteristics([rxUUID, txUUID], for: found)
@@ -973,7 +1111,7 @@ extension BleEngine: CBPeripheralDelegate {
       }
     }
     guard let tx = link.tx, link.rx != nil else {
-      closeCentralLink(link, reason: "characteristicNotFound")
+      closeCentralLink(link, reason: "no_service")
       return
     }
     if tx.isNotifying {
@@ -1122,6 +1260,7 @@ extension BleEngine: CBPeripheralManagerDelegate {
     didSubscribeTo characteristic: CBCharacteristic
   ) {
     guard characteristic.uuid == txUUID else { return }
+    refreshScanIfStale()
     closedCentrals.remove(central.identifier)
     openPeripheralLink(for: central)
   }
@@ -1132,6 +1271,7 @@ extension BleEngine: CBPeripheralManagerDelegate {
     didUnsubscribeFrom characteristic: CBCharacteristic
   ) {
     guard characteristic.uuid == txUUID else { return }
+    refreshScanIfStale()
     // 切断時にも呼ばれる。次に購読してきたら新しいリンクとして受け付ける
     closedCentrals.remove(central.identifier)
     guard let link = peripheralLinks[central.identifier] else { return }

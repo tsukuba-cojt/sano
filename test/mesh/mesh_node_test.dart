@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:kairanban/core/envelope.dart';
+import 'package:kairanban/mesh/mesh_node.dart';
 import 'package:kairanban/mesh/message_store.dart';
 import 'package:kairanban/transport/fake_transport.dart';
 
@@ -175,19 +176,25 @@ void main() {
     expect(linksOpened(), opened);
   });
 
-  test('投稿の自動再接続は 60 秒以内に見えた相手にだけ行う', () async {
+  test('離れた相手には数回試すだけで、投稿の自動再接続は最近見えた相手にだけ行う', () async {
     final a = await makeNode('A', 1);
     final b = await makeNode('B', 2);
     radio.discover('A', 'B');
     await radio.settle();
     expect(linksOpened(), 1);
-    await radio.elapse(const Duration(seconds: 120));
+    // B が離れる。一度同期できた相手には発見の通知が無くても少しの間は同期し直しを試みる。
+    radio.unreachable.add('B');
+    final before = connectAttempts();
+    await radio.elapse(const Duration(seconds: 300));
+    final tried = connectAttempts() - before;
+    expect(tried, inInclusiveRange(1, 5));
     expect(a.node.nearbyCount, 0);
     await a.node.publish(
         makeNotice(origin: a.nodeId, createdAt: radio.clock.now()));
     await radio.settle();
-    expect(linksOpened(), 1);
+    expect(connectAttempts(), before + tried);
     expect(b.store.count, 0);
+    radio.unreachable.clear();
     radio.discover('A', 'B');
     await radio.settle();
     expect(linksOpened(), 2);
@@ -219,6 +226,51 @@ void main() {
     expect(connectAttempts(), 2);
   });
 
+  test('ネイティブが自分で断った接続（busy など）は失敗に数えず、次の見直しで試し直す', () async {
+    final a = await makeNode('A', 1);
+    final b = await makeNode('B', 2);
+    await b.node.publish(
+      makeNotice(origin: b.nodeId, createdAt: radio.clock.now()),
+    );
+    radio.failWith['B'] = 'busy';
+    radio.discover('A', 'B');
+    await radio.settle();
+    expect(connectAttempts(), 1);
+    expect(a.node.peers.single.failures, 0);
+    radio.failWith.clear();
+    await radio.elapse(const Duration(seconds: kMeshTickSeconds + 1));
+    expect(linksOpened(), 1);
+    expect(a.store.count, 1);
+  });
+
+  test('Apple の背面広告から見つけた相手は、1 回の失敗では 15 分無視せず 30 秒で試し直す', () async {
+    final a = await makeNode('A', 1);
+    await makeNode('B', 2);
+    radio.unreachable.add('B');
+    radio.discover('A', 'B', viaApple: true);
+    await radio.settle();
+    expect(a.node.peers.single.failures, 1);
+    expect(a.node.peers.single.ignoreUntil, 0);
+    radio.unreachable.clear();
+    await radio.elapse(const Duration(seconds: 31));
+    radio.discover('A', 'B', viaApple: true);
+    await radio.settle();
+    expect(linksOpened(), 1);
+  });
+
+  test('Apple の背面広告から見つけた相手が 3 回続けて失敗したら 15 分無視する', () async {
+    final a = await makeNode('A', 1);
+    await makeNode('B', 2);
+    radio.unreachable.add('B');
+    for (var i = 0; i < 3; i++) {
+      radio.discover('A', 'B', viaApple: true);
+      await radio.settle();
+      await radio.elapse(const Duration(seconds: 31));
+    }
+    expect(a.node.peers.single.failures, 3);
+    expect(a.node.peers.single.ignoreUntil, greaterThan(radio.clock.now()));
+  });
+
   test('接続に失敗した相手は 30 秒待つ', () async {
     final a = await makeNode('A', 1);
     await makeNode('B', 2);
@@ -231,10 +283,9 @@ void main() {
     radio.discover('A', 'B');
     await radio.settle();
     expect(connectAttempts(), 1);
-    await radio.elapse(const Duration(seconds: 2));
+    // 30 秒たてば、発見の通知が無くても自動で試し直す（見直しは 15 秒ごと）。
     radio.unreachable.clear();
-    radio.discover('A', 'B');
-    await radio.settle();
+    await radio.elapse(const Duration(seconds: kMeshTickSeconds + 1));
     expect(connectAttempts(), 2);
     expect(linksOpened(), 1);
     expect(a.node.peers.single.failures, 0);
@@ -249,21 +300,26 @@ void main() {
           origin: n.nodeId, createdAt: radio.clock.now(), title: 'p$i'));
       others.add(n);
     }
-    // 4 台を同時に発見。セッションが終わる前に判断するため settle しない。
+    var maxInitiator = 0;
+    a.node.addListener(() {
+      final n = a.node.sessions.where((s) => s.initiator).length;
+      if (n > maxInitiator) {
+        maxInitiator = n;
+      }
+    });
+    // 4 台を同時に 1 回だけ発見。上限で後回しにした相手にも、枠が空けば
+    // 発見の通知を待たずに接続する。
     for (var i = 0; i < 4; i++) {
       radio.discover('A', 'P$i');
     }
     await radio.settle();
-    expect(linksOpened(), 2);
-    expect(a.store.count, 2);
-    expect(a.node.activeSessions, 0);
-    // 空いたら残りも接続する。
-    for (var i = 0; i < 4; i++) {
-      radio.discover('A', 'P$i');
-    }
-    await radio.settle();
-    expect(linksOpened(), 4);
+    expect(maxInitiator, 2);
     expect(a.store.count, 4);
+    expect(a.node.activeSessions, 0);
+    // A が受け取った分は、先に同期した相手にも続けて渡す（4 台すべてが揃う）。
+    for (final n in others) {
+      expect(n.store.count, 4, reason: n.id);
+    }
   });
 
   test('nearbyCount は直近 60 秒に見えた端末数', () async {
@@ -275,8 +331,10 @@ void main() {
     radio.discover('A', 'B');
     await radio.settle();
     expect(a.node.nearbyCount, 2);
+    radio.unreachable.addAll(['B', 'C']);
     await radio.elapse(const Duration(seconds: 61));
     expect(a.node.nearbyCount, 0);
+    radio.unreachable.clear();
     radio.discover('A', 'C');
     await radio.settle();
     expect(a.node.nearbyCount, 1);

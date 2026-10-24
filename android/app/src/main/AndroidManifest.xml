@@ -30,6 +30,8 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- 交換完了の振動（中継役）と緊急通知の振動 -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 画面オフでも接続・同期の途中で CPU が眠らないようにする（BLE の出来事の間だけ）。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- BLE 非対応端末にはインストールさせない -->
     <uses-feature
