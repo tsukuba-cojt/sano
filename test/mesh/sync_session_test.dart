@@ -20,6 +20,7 @@ class Peer {
     required int index,
     this.sessionByteBudget = 65536,
     this.autoSession = true,
+    this.caps = kDefaultCaps,
   })  : transport = radio.createTransport(id),
         nodeId = nodeIdOf(index) {
     store = MessageStore(MemoryStoreBackend());
@@ -34,6 +35,9 @@ class Peer {
 
   /// false なら LinkOpened でセッションを作らない（手動応答のテスト用）。
   final bool autoSession;
+
+  /// HELLO に載せる能力ビット（旧版の模擬に使う）。
+  final int caps;
 
   late final MessageStore store;
   final List<SyncSession> sessions = <SyncSession>[];
@@ -67,6 +71,7 @@ class Peer {
             sessionByteBudget: sessionByteBudget,
             log: log.add,
             createTimer: radio.clock.createTimer,
+            caps: caps,
           );
           sessions.add(s);
           unawaited(s.start());
@@ -193,6 +198,44 @@ void main() {
         .map((f) => Envelope.decode(f.payload).kind)
         .toList();
     expect(messagesAtA.first, MessageKind.groupInfo);
+  });
+
+  test('双方が対応していれば目録を要約（INVENTORY_FILTER）で送り、同じ内容にそろう', () async {
+    a = Peer(radio, 'A', index: 1);
+    b = Peer(radio, 'B', index: 2);
+    final t = radio.clock.now();
+    for (var i = 0; i < 20; i++) {
+      await a.store.add(makeNotice(origin: nodeIdOf(30 + i), createdAt: t - i), now: t);
+    }
+    await b.store.add(makeNotice(origin: nodeIdOf(80), createdAt: t - 5), now: t);
+    await connectAB();
+    expect(a.session.succeeded, isTrue);
+    expect(idsOf(a.store), idsOf(b.store));
+    final framesAtB = framesOf(b.received).map((f) => f.type).toList();
+    expect(framesAtB, contains(FrameType.inventoryFilter));
+    expect(framesAtB, isNot(contains(FrameType.inventory)));
+  });
+
+  test('要約に対応していない旧版の相手とは、一覧（INVENTORY）で同期できる', () async {
+    a = Peer(radio, 'A', index: 1);
+    b = Peer(radio, 'B', index: 2, caps: kDefaultCaps & ~kCapInventoryFilter);
+    final t = radio.clock.now();
+    for (var i = 0; i < 20; i++) {
+      await a.store.add(makeNotice(origin: nodeIdOf(30 + i), createdAt: t - i), now: t);
+    }
+    for (var i = 0; i < 3; i++) {
+      await b.store.add(makeNotice(origin: nodeIdOf(90 + i), createdAt: t - i), now: t);
+    }
+    await connectAB();
+    expect(a.session.succeeded, isTrue);
+    expect(b.session.succeeded, isTrue);
+    expect(a.store.count, 23);
+    expect(idsOf(a.store), idsOf(b.store));
+    final framesAtB = framesOf(b.received).map((f) => f.type).toList();
+    final framesAtA = framesOf(a.received).map((f) => f.type).toList();
+    expect(framesAtB, contains(FrameType.inventory));
+    expect(framesAtB, isNot(contains(FrameType.inventoryFilter)));
+    expect(framesAtA, isNot(contains(FrameType.inventoryFilter)));
   });
 
   test('同じものを持っていれば何も送らない', () async {
