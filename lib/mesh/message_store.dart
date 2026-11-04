@@ -279,18 +279,76 @@ class MessageStore extends ChangeNotifier {
     required int now,
     bool isLocal = false,
   }) async {
+    final r = _insert(envelope, now: now, isLocal: isLocal);
+    if (r.result != AddResult.added) {
+      return r.result;
+    }
+    await _persistRecords(r.records, forceCompactIf: r.compact);
+    notifyListeners();
+    return AddResult.added;
+  }
+
+  /// 多数の封筒をまとめて保存する（実機テスト用の大量データ、#152）。判定は
+  /// [add] と同じで、書き込みと変更の通知を 1 回にまとめる。保存できた件数を返す。
+  Future<int> addAll(
+    Iterable<Envelope> envelopes, {
+    required int now,
+    bool isLocal = false,
+  }) async {
+    final records = <Uint8List>[];
+    var compact = false;
+    var added = 0;
+    for (final e in envelopes) {
+      final r = _insert(e, now: now, isLocal: isLocal);
+      if (r.result == AddResult.added) {
+        added++;
+        records.addAll(r.records);
+        compact = compact || r.compact;
+      }
+    }
+    if (added == 0) {
+      return 0;
+    }
+    await _persistRecords(records, forceCompactIf: compact);
+    notifyListeners();
+    return added;
+  }
+
+  /// [test] に合うものをこの端末から消す（実機テスト用データの片付け、#152）。
+  /// 取り消し（tombstone）は出さないので、ほかの端末には残る。消した件数を返す。
+  Future<int> removeWhere(bool Function(StoredMessage m) test) async {
+    final victims = _messages.values.where(test).toList();
+    if (victims.isEmpty) {
+      return 0;
+    }
+    for (final m in victims) {
+      _remove(m);
+    }
+    _rebuildIndexes();
+    _version++;
+    await _persistRecords(const [], forceCompactIf: true);
+    notifyListeners();
+    return victims.length;
+  }
+
+  ({AddResult result, List<Uint8List> records, bool compact}) _insert(
+    Envelope envelope, {
+    required int now,
+    required bool isLocal,
+  }) {
+    const none = <Uint8List>[];
     if (_messages.containsKey(envelope.msgId)) {
-      return AddResult.duplicate;
+      return (result: AddResult.duplicate, records: none, compact: false);
     }
     if (envelope.hop >= kMaxRelayHop) {
-      return AddResult.rejected;
+      return (result: AddResult.rejected, records: none, compact: false);
     }
     final ttl = envelope.ttlSeconds;
     if (ttl <= 0 || ttl > _maxTtlFor(envelope.kind)) {
-      return AddResult.rejected;
+      return (result: AddResult.rejected, records: none, compact: false);
     }
     if (envelope.isStub) {
-      return AddResult.rejected;
+      return (result: AddResult.rejected, records: none, compact: false);
     }
     if (!envelope.isOpaque) {
       // body の形式検証（decode 済みの封筒なら通るが、ローカル生成も同じ経路）。
@@ -304,16 +362,16 @@ class MessageStore extends ChangeNotifier {
           case MessageKind.tombstone:
           case MessageKind.ack:
             if (envelope.supersedes == null || envelope.bodyPlain.isNotEmpty) {
-              return AddResult.rejected;
+              return (result: AddResult.rejected, records: none, compact: false);
             }
           case MessageKind.unknown:
-            return AddResult.rejected;
+            return (result: AddResult.rejected, records: none, compact: false);
         }
       } on EnvelopeFormatException {
-        return AddResult.rejected;
+        return (result: AddResult.rejected, records: none, compact: false);
       }
       if (envelope.supersedes == envelope.msgId) {
-        return AddResult.rejected;
+        return (result: AddResult.rejected, records: none, compact: false);
       }
     }
 
@@ -352,10 +410,11 @@ class MessageStore extends ChangeNotifier {
       for (final t in touched) _encodeUpdate(t),
     ];
     _dirtyRecords += removed.length + touched.length;
-    await _persistRecords(records,
-        forceCompactIf: erased || removed.length >= 50);
-    notifyListeners();
-    return AddResult.added;
+    return (
+      result: AddResult.added,
+      records: records,
+      compact: erased || removed.length >= 50,
+    );
   }
 
   /// 種類ごとの有効期間の上限（C12）。お知らせは 30 日、取り消しは対象 + 24 時間、
@@ -1126,10 +1185,10 @@ class MessageStore extends ChangeNotifier {
       if (compact) {
         _dirtyRecords = 0;
         await _backend.rewrite(_snapshotRecords());
-      } else {
-        for (final r in records) {
-          await _backend.append(r);
-        }
+      } else if (records.length == 1) {
+        await _backend.append(records.single);
+      } else if (records.isNotEmpty) {
+        await _backend.appendAll(records);
       }
     });
   }

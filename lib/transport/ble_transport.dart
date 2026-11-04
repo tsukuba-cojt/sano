@@ -395,7 +395,9 @@ class BleTransport implements Transport {
         return LinkOpened(
           linkId: _asInt(map['linkId']),
           peerId: _asString(map['peerId']),
-          maxChunk: _asInt(map['maxChunk']),
+          maxChunk: _asInt(map['maxChunk']) > kMaxChunkBytes
+              ? kMaxChunkBytes
+              : _asInt(map['maxChunk']),
           initiator: _asBool(map['initiator']),
         );
       case 'data':

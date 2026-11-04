@@ -197,7 +197,7 @@ class _HomeScreenState extends State<HomeScreen> {
           final nowTime = dateTimeFromEpoch(_c.now);
           final lastSync = _lastSyncAt();
           final lastReceived = node.lastReceivedAt;
-          final lastSent = node.lastSentAt;
+          final lastSent = _c.lastHandedAt ?? node.lastSentAt;
           final keepUntil = _c.keepScreenOnUntil;
           final urgentIds = _c.foregroundUrgentIds;
           _triggerUrgentHaptics(urgentIds.length);
@@ -227,6 +227,7 @@ class _HomeScreenState extends State<HomeScreen> {
             onStopKeepScreenOn: _c.stopKeepScreenOn,
             relayMode: settings.relayMode,
             lastSentAt: lastSent == null ? null : dateTimeFromEpoch(lastSent),
+            lastSentCount: _c.lastHandedAt == null ? 0 : _c.lastHandedCount,
             storeCount: _c.store.count,
             groupSummary: groupSummary,
             inForeground: _c.inForeground,
@@ -750,7 +751,9 @@ class _LargeStatusScreen extends StatelessWidget {
             final node = controller.node;
             final nowTime = dateTimeFromEpoch(controller.now);
             final received = node.lastReceivedAt;
-            final sent = node.lastSentAt;
+            final sent = controller.lastHandedAt ?? node.lastSentAt;
+            final sentCount =
+                controller.lastHandedAt == null ? 0 : controller.lastHandedCount;
             final urgent = controller.foregroundUrgentIds.isNotEmpty;
             return SafeArea(
               child: Padding(
@@ -772,7 +775,8 @@ class _LargeStatusScreen extends StatelessWidget {
                     Text(
                       sent == null
                           ? 'まだ 渡していません'
-                          : '最後に 渡したのは ${MeshStatusBar.describeTime(dateTimeFromEpoch(sent), nowTime)}',
+                          : '最後に 渡したのは ${MeshStatusBar.describeTime(dateTimeFromEpoch(sent), nowTime)}'
+                              '${sentCount > 0 ? '（${formatCountJa(sentCount, '件')}）' : ''}',
                       style: big,
                     ),
                     const SizedBox(height: 16),

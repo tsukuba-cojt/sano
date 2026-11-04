@@ -8,6 +8,7 @@ import 'package:kairanban/core/report.dart';
 
 import 'screens/compose_screen.dart';
 import 'screens/create_group_screen.dart';
+import 'screens/developer_screen.dart';
 import 'screens/diagnostics_screen.dart';
 import 'screens/group_detail_screen.dart';
 import 'screens/join_screen.dart';
@@ -103,6 +104,11 @@ Future<void> openGroupDetail(
 /// 通信の状態（診断）。
 Future<void> openDiagnostics(BuildContext context, AppController controller) {
   return _push<void>(context, DiagnosticsScreen(controller: controller));
+}
+
+/// 開発者メニュー（実機テスト用のデータ、#152）。
+Future<void> openDeveloperMenu(BuildContext context, AppController controller) {
+  return _push<void>(context, DeveloperScreen(controller: controller));
 }
 
 /// 「本部に 知らせる」画面（SOS・無事です・在宅避難・困っています）。

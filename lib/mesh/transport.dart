@@ -1,6 +1,10 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+/// 1 回に書ける・通知できるバイト数の上限。ATT は MTU − 3（最大 514）まで許すが、
+/// Android の GATT は属性値を 512 バイトまでしか扱わない（#152 の実測）。
+const int kMaxChunkBytes = 512;
+
 /// すれ違い通信のリンク層インターフェース。
 ///
 /// 実装: [BleTransport]（ネイティブ BLE）、[HubTransport]（開発用 TCP ハブ）、

@@ -18,6 +18,9 @@ abstract class StoreBackend {
   /// レコードを末尾に追記する。
   Future<void> append(Uint8List record);
 
+  /// 複数のレコードを 1 回の書き込みで末尾に追記する（まとめて受け取ったとき）。
+  Future<void> appendAll(List<Uint8List> records);
+
   /// 全レコードを [records] で置き換える（圧縮）。
   Future<void> rewrite(List<Uint8List> records);
 }
@@ -45,6 +48,12 @@ class MemoryStoreBackend implements StoreBackend {
   Future<void> append(Uint8List record) async {
     appendCount++;
     _records.add(Uint8List.fromList(record));
+  }
+
+  @override
+  Future<void> appendAll(List<Uint8List> records) async {
+    appendCount++;
+    _records.addAll(records.map(Uint8List.fromList));
   }
 
   @override
@@ -119,6 +128,18 @@ class FileStoreBackend implements StoreBackend {
         final file = File(path);
         await file.parent.create(recursive: true);
         await file.writeAsBytes(_frame(record),
+            mode: FileMode.append, flush: true);
+      });
+
+  @override
+  Future<void> appendAll(List<Uint8List> records) => _serialized(() async {
+        final file = File(path);
+        await file.parent.create(recursive: true);
+        final builder = BytesBuilder(copy: false);
+        for (final r in records) {
+          builder.add(_frame(r));
+        }
+        await file.writeAsBytes(builder.takeBytes(),
             mode: FileMode.append, flush: true);
       });
 

@@ -38,6 +38,9 @@ const int kNearbyWindowSeconds = 60;
 /// 診断ログの保持行数。
 const int kRecentLogLines = 100;
 
+/// 残しておく交換の記録の件数（転送の量と秒数、#152）。
+const int kRecentSessionStats = 30;
+
 /// 時計のずれの判定に使う直近の TIME の件数。
 const int kClockSamples = 8;
 
@@ -101,6 +104,57 @@ class PeerRecord {
       'failures: $failures, lastSyncAt: $lastSyncAt)';
 }
 
+/// 1 回の交換の記録。転送の量と秒数を実機で測るために残す（#152）。
+class SessionStat {
+  const SessionStat({
+    required this.at,
+    required this.peerNodeHex,
+    required this.initiator,
+    required this.succeeded,
+    required this.messagesSent,
+    required this.messagesReceived,
+    required this.bytesSent,
+    required this.bytesReceived,
+    required this.elapsed,
+    this.firstMessageAfter,
+    this.hasMore = false,
+    this.failureReason,
+  });
+
+  /// 終わった時刻（エポック秒）。
+  final int at;
+
+  /// 相手のノード ID（16 進）。HELLO 前に切れたら null。
+  final String? peerNodeHex;
+
+  /// こちらから接続したか。
+  final bool initiator;
+  final bool succeeded;
+  final int messagesSent;
+  final int messagesReceived;
+  final int bytesSent;
+  final int bytesReceived;
+
+  /// 始めてから終わるまでの時間。
+  final Duration elapsed;
+
+  /// 始めてから最初のお知らせを受け取るまでの時間。
+  final Duration? firstMessageAfter;
+
+  /// 送りきれずに続きがあったか。
+  final bool hasMore;
+  final String? failureReason;
+
+  /// 1 秒あたりに運んだバイト数（送受信の合計）。時間が 0 なら null。
+  double? get bytesPerSecond {
+    final ms = elapsed.inMilliseconds;
+    if (ms <= 0) {
+      return null;
+    }
+    return (bytesSent + bytesReceived) * 1000 / ms;
+  }
+}
+
 class _NodeSync {
   _NodeSync({
     required this.lastSyncAt,
@@ -144,6 +198,7 @@ class MeshNode extends ChangeNotifier {
     this._helloTimeout = kHelloTimeout,
     this._sessionTimeout = kSessionTimeout,
     this.onSyncCompleted,
+    this.onHanded,
   })  : nodeId = Uint8List.fromList(nodeId),
         _nodeIdHex = hexOf(nodeId),
         _now = now ?? nowEpochSeconds,
@@ -174,6 +229,11 @@ class MeshNode extends ChangeNotifier {
   /// 同期が完了するたびに呼ばれる（時刻の保存・交換完了の音用、C04 C07）。
   final void Function(int epochSeconds, int sent, int received)? onSyncCompleted;
 
+  /// 同期が完了し、相手（ノード ID の 16 進）に MESSAGE を渡したときに呼ばれる
+  /// （「この端末から 渡した 台数」用、C18）。
+  final void Function(String peerNodeHex, List<int> sentIds, int epochSeconds)?
+      onHanded;
+
   StreamSubscription<TransportEvent>? _subscription;
   final Map<String, PeerRecord> _peers = <String, PeerRecord>{};
   final Map<String, _NodeSync> _nodeSync = <String, _NodeSync>{};
@@ -186,6 +246,7 @@ class MeshNode extends ChangeNotifier {
   final Map<String, int> _pendingConnects = <String, int>{};
   final Set<SyncSession> _abortedByNode = <SyncSession>{};
   final Queue<String> _log = Queue<String>();
+  final Queue<SessionStat> _sessionStats = Queue<SessionStat>();
   final Queue<int> _clockOffsets = Queue<int>();
 
   bool _running = false;
@@ -275,6 +336,9 @@ class MeshNode extends ChangeNotifier {
   /// 最新 100 行の診断ログ（古い順）。
   List<String> get recentLog => List.unmodifiable(_log);
 
+  /// 最近の交換の記録（古い順、最大 [kRecentSessionStats] 件）。
+  List<SessionStat> get recentSessions => List.unmodifiable(_sessionStats);
+
   /// 発見済みの端末記録。
   List<PeerRecord> get peers => List.unmodifiable(_peers.values);
 
@@ -340,6 +404,12 @@ class MeshNode extends ChangeNotifier {
   }
 
   /// 中継役として動くか（HELLO の caps、同時接続数、再接続間隔に効く）。
+  /// 保存が外から増えた（実機テスト用のデータなど）。近くの端末とすぐ同期し直す。
+  void nudge() {
+    _reconnectRecentPeers();
+    notifyListeners();
+  }
+
   void setRelayMode(bool v) {
     if (_relayMode == v) {
       return;
@@ -734,6 +804,23 @@ class MeshNode extends ChangeNotifier {
     }
     _totalMessagesReceived += session.messagesReceived;
     _totalMessagesSent += session.messagesSent;
+    _sessionStats.addLast(SessionStat(
+      at: t,
+      peerNodeHex: hex,
+      initiator: session.initiator,
+      succeeded: session.succeeded,
+      messagesSent: session.messagesSent,
+      messagesReceived: session.messagesReceived,
+      bytesSent: session.bytesSent,
+      bytesReceived: session.bytesReceived,
+      elapsed: session.elapsed,
+      firstMessageAfter: session.firstMessageAfter,
+      hasMore: session.hasMore,
+      failureReason: session.failureReason,
+    ));
+    while (_sessionStats.length > kRecentSessionStats) {
+      _sessionStats.removeFirst();
+    }
     if (session.messagesReceived > 0) {
       _lastReceivedAt = t;
     }
@@ -767,6 +854,9 @@ class MeshNode extends ChangeNotifier {
         '送信 ${session.messagesSent} 件${session.hasMore ? '（続きあり）' : ''}',
       );
       onSyncCompleted?.call(t, session.messagesSent, session.messagesReceived);
+      if (hex != null && session.messagesSent > 0) {
+        onHanded?.call(hex, session.sentMessageIds, t);
+      }
       if (session.hasMore) {
         // 打ち切った続きを少し待って同期する（相手が接続してくる場合もある）。
         (_createTimer ?? Timer.new)(

@@ -804,7 +804,7 @@ class BleEngine(context: Context, private val listener: Listener) {
             "linkOpened",
             "linkId" to link.id,
             "peerId" to link.peerId,
-            "maxChunk" to link.mtu - 3,
+            "maxChunk" to maxChunkOf(link),
             "initiator" to false,
         )
         for (chunk in link.earlyData) {
@@ -856,24 +856,29 @@ class BleEngine(context: Context, private val listener: Listener) {
         }
         link.writeAttempts++
         val accepted: Boolean
-        val busy: Boolean
+        val retry: Boolean
+        var code = 0
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val rc = try {
                 server.notifyCharacteristicChanged(device, tx, false, data)
             } catch (e: RuntimeException) {
                 BluetoothStatusCodes.ERROR_UNKNOWN
             }
+            code = rc
             accepted = rc == BluetoothStatusCodes.SUCCESS
-            busy = rc == BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY
+            retry = isTransientWriteError(rc)
         } else {
             accepted = notifyLegacy(server, device, tx, data)
-            busy = !accepted
+            retry = !accepted
         }
         when {
             accepted -> Unit // onNotificationSent で完了する
-            busy && link.writeAttempts < MAX_WRITE_ATTEMPTS ->
+            retry && link.writeAttempts < MAX_WRITE_ATTEMPTS ->
                 handler.postDelayed({ sendServer(link, data) }, WRITE_RETRY_DELAY_MS)
-            else -> completeSend(link, "notify_rejected")
+            else -> {
+                log("通知を送れません #${link.id} rc=$code 試行 ${link.writeAttempts} 回")
+                completeSend(link, "notify_rejected_$code")
+            }
         }
     }
 
@@ -1164,16 +1169,26 @@ class BleEngine(context: Context, private val listener: Listener) {
             "linkOpened",
             "linkId" to link.id,
             "peerId" to link.peerId,
-            "maxChunk" to link.mtu - 3,
+            "maxChunk" to maxChunkOf(link),
             "initiator" to true,
         )
+        for (chunk in link.earlyData) {
+            emit("data", "linkId" to link.id, "data" to chunk)
+        }
+        link.earlyData.clear()
     }
 
     private fun handleNotification(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
         val link = gattLinks[gatt] ?: return
-        if (!link.opened || link.finished) return
+        if (link.finished) return
         if (characteristic.uuid != config?.txUuid) return
         keepAwake(WAKE_LINK_MS)
+        if (!link.opened) {
+            // 相手は購読を受けた直後に HELLO を送るので、こちらの購読完了
+            // （onDescriptorWrite）より先に届くことがある。捨てずに溜めておく（#152）。
+            if (link.earlyData.size < MAX_EARLY_CHUNKS) link.earlyData.add(value)
+            return
+        }
         emit("data", "linkId" to link.id, "data" to value)
     }
 
@@ -1202,10 +1217,13 @@ class BleEngine(context: Context, private val listener: Listener) {
             }
             when {
                 rc == BluetoothStatusCodes.SUCCESS -> completeSend(link, null) // スタックに渡った
-                rc == BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY &&
+                isTransientWriteError(rc) &&
                     link.writeAttempts < MAX_WRITE_ATTEMPTS ->
                     handler.postDelayed({ sendClient(link, data) }, WRITE_RETRY_DELAY_MS)
-                else -> completeSend(link, "write_failed_$rc")
+                else -> {
+                    log("書き込めません #${link.id} rc=$rc 試行 ${link.writeAttempts} 回")
+                    completeSend(link, "write_failed_$rc")
+                }
             }
         } else {
             val accepted = writeCharacteristicLegacy(gatt, rx, data)
@@ -1217,6 +1235,13 @@ class BleEngine(context: Context, private val listener: Listener) {
             }
         }
     }
+
+    /**
+     * 待てば通る書き込みの失敗か（BUSY だけ）。ほかの失敗をやり直すと、実は送れて
+     * いたチャンクを二重に送り、詰めて書いたフレームの列が壊れるおそれがある。
+     */
+    private fun isTransientWriteError(rc: Int): Boolean =
+        rc == BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY
 
     @Suppress("DEPRECATION")
     private fun writeCharacteristicLegacy(
@@ -1235,6 +1260,14 @@ class BleEngine(context: Context, private val listener: Listener) {
 
     // ================================================================ 送信・終了の共通処理
 
+    /**
+     * 1 回に書ける・通知できるバイト数。ATT の上限は MTU − 3 だが、Android の
+     * GATT は属性値を 512 バイトまでしか扱わず、514 バイトの書き込みは
+     * ERROR_UNKNOWN で失敗し続ける（エミュレータで 600 件の要約が 2 チャンクに
+     * なったときに判明、#152）。
+     */
+    private fun maxChunkOf(link: Link): Int = minOf(link.mtu - 3, MAX_ATTR_LEN)
+
     private fun sendInternal(linkId: Int, data: ByteArray, callback: (String?) -> Unit) {
         val link = links[linkId]
         if (link == null || link.finished || !link.opened) {
@@ -1246,7 +1279,7 @@ class BleEngine(context: Context, private val listener: Listener) {
             callback("busy")
             return
         }
-        if (data.size > link.mtu - 3) {
+        if (data.size > maxChunkOf(link)) {
             callback("too_large")
             return
         }
@@ -1453,6 +1486,8 @@ class BleEngine(context: Context, private val listener: Listener) {
         private const val RETRY_133_DELAY_MS = 500L
         private const val WRITE_RETRY_DELAY_MS = 8L
         private const val MAX_WRITE_ATTEMPTS = 600
+        private const val MAX_ATTR_LEN = 512
+        private const val MAX_EARLY_CHUNKS = 64
         private const val SCAN_RESTART_MS = 9 * 60_000L
         private const val SCAN_QUOTA_WINDOW_MS = 30_000L
         private const val SCAN_QUOTA_COUNT = 5

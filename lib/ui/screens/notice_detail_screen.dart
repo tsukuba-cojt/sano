@@ -174,7 +174,7 @@ class _NoticeDetailScreenState extends State<NoticeDetailScreen> {
     return Scaffold(
       appBar: const KairanAppBar(title: 'お知らせ', showBack: true),
       body: ListenableBuilder(
-        listenable: _c.store,
+        listenable: Listenable.merge([_c.store, _c]),
         builder: (context, _) {
           final m = _c.store.get(_msgId);
           if (m == null || m.isStub) {
@@ -192,6 +192,7 @@ class _NoticeDetailScreenState extends State<NoticeDetailScreen> {
           final received = dateTimeFromEpoch(m.receivedAt);
           final expires = dateTimeFromEpoch(_c.store.localExpiresAt(m));
           final elapsed = Duration(seconds: _c.now - env.createdAt);
+          final handed = _c.handedOf(m);
           final receivedText = _sameDay(created, received)
               ? formatTimeJa(received)
               : formatDateTimeJa(received);
@@ -363,7 +364,17 @@ class _NoticeDetailScreenState extends State<NoticeDetailScreen> {
                 style: KairanTextStyles.meta,
               ),
               const SizedBox(height: 4),
-              if (!m.isLocal)
+              if (handed != null) ...[
+                Text(
+                  'この端末から 渡した: ${formatCountJa(handed.devices, '台')}'
+                  '${handed.lastAt == null ? '' : '（最後は ${formatTimeJa(dateTimeFromEpoch(handed.lastAt!))}）'}',
+                  style: KairanTextStyles.meta,
+                ),
+                const Text(
+                  '近くの スマホに 直接 渡した 数です。その先に 広がった 数は 分かりません',
+                  style: KairanTextStyles.metaSecondary,
+                ),
+              ] else if (!m.isLocal)
                 Text('転送 ${formatCountJa(env.hop, '回')}', style: KairanTextStyles.meta),
               const SizedBox(height: 4),
               Text(

@@ -10,6 +10,7 @@
 library;
 
 import 'dart:async';
+import 'dart:collection';
 import 'dart:typed_data';
 
 import '../core/envelope.dart';
@@ -197,12 +198,26 @@ class SyncSession {
   String? _failureReason;
   Timer? _helloTimer;
   Timer? _sessionTimer;
+  final Stopwatch _watch = Stopwatch();
+  Duration? _firstMessageAfter;
 
-  /// 送信を直列化するためのチェーン（先出しと本線の送信が混ざらないように）。
-  Future<void> _sendQueue = Future<void>.value();
+  /// 送信待ちのフレーム。順に詰めて、1 回の書き込みを maxChunk いっぱいに使う
+  /// （お知らせ 1 件 約 160 B を 1 回ずつ書くと 512 B の 3 割しか使えない、#152）。
+  final Queue<({Uint8List bytes, Completer<void>? done})> _out =
+      Queue<({Uint8List bytes, Completer<void>? done})>();
+  int _outOffset = 0;
+  int _outBuffered = 0;
+  bool _pumping = false;
+  Completer<void>? _drained;
+  Object? _sendError;
 
-  /// 受信した MESSAGE を順に保存するためのチェーン。
+  /// 受信した MESSAGE の保存（[_drainStores]）が終わると完了する。
   Future<void> _storeQueue = Future<void>.value();
+
+  /// 保存待ちの受信封筒。書き込み中に届いた分はまとめて 1 回で保存する
+  /// （1 件ずつ fsync すると 300 件で 50 秒かかった、#152 の実測）。
+  final List<Envelope> _pendingStores = <Envelope>[];
+  bool _storing = false;
 
   SessionState get state => _state;
 
@@ -238,6 +253,12 @@ class SyncSession {
 
   /// 送った MESSAGE の件数（先出しを含む）。
   int get messagesSent => _messagesSent;
+
+  /// 始めてから終わるまで（終わっていなければ今まで）の時間。転送速度の実測用。
+  Duration get elapsed => _watch.elapsed;
+
+  /// 始めてから最初の MESSAGE を受け取るまでの時間。受け取っていなければ null。
+  Duration? get firstMessageAfter => _firstMessageAfter;
 
   /// 先出しした件数。
   int get pushedCount => _pushed.length;
@@ -313,6 +334,7 @@ class SyncSession {
       return _startCompleter.future;
     }
     _started = true;
+    _watch.start();
     _helloTimer = _createTimer(_helloTimeout, () {
       if (_state == SessionState.hello) {
         _fail('HELLO 待ちタイムアウト');
@@ -399,11 +421,14 @@ class SyncSession {
         if (isFinished) {
           return;
         }
-        final sent = await _sendMessage(m);
+        final sent = _sendMessage(m);
         if (sent == _SendOutcome.budget) {
           _budgetExhausted = true;
           _logLine('送信上限 $_byteBudget バイトに達したため打ち切り');
           break;
+        }
+        if (_outBuffered > maxChunk * 2) {
+          await _waitDrain();
         }
       }
       if (isFinished) {
@@ -422,8 +447,8 @@ class SyncSession {
     }
   }
 
-  /// 1 件の MESSAGE を上限内で送る。
-  Future<_SendOutcome> _sendMessage(StoredMessage m) async {
+  /// 1 件の MESSAGE を上限内で送信待ちに積む。
+  _SendOutcome _sendMessage(StoredMessage m) {
     final wire = m.wireBytesAt(_now(), localExpiresAt: _store.localExpiresAt(m));
     final bytes = Frame.message(wire).encode();
     if (_messageBytesSent + bytes.length > _byteBudget) {
@@ -435,7 +460,7 @@ class SyncSession {
       }
       _opaqueBytesSent += bytes.length;
     }
-    await _enqueueSend(bytes);
+    _bufferSend(bytes);
     _messageBytesSent += bytes.length;
     _messagesSent++;
     _sentIds.add(m.msgId);
@@ -464,32 +489,121 @@ class SyncSession {
       }
       bytes += frame.length;
       _pushed.add(m.msgId);
-      await _enqueueSend(frame);
+      _bufferSend(frame);
       _messageBytesSent += frame.length;
       _messagesSent++;
       _sentIds.add(m.msgId);
+      if (_outBuffered > maxChunk * 2) {
+        await _waitDrain();
+      }
     }
     if (_pushed.isNotEmpty) {
       _logLine('先出し ${_pushed.length} 件 ($bytes B)');
     }
   }
 
-  /// 送信を直列化する（フレーム単位で混ざらないようにする）。
+  /// フレームを送信待ちに積み、書き終えたら完了する（順序は積んだ順）。
   Future<void> _enqueueSend(Uint8List bytes) {
-    final next = _sendQueue.then((_) => _sendBytes(bytes));
-    _sendQueue = next.then((_) {}, onError: (_) {});
-    return next;
+    final err = _sendError;
+    if (err != null) {
+      return Future<void>.error(err);
+    }
+    final done = Completer<void>();
+    done.future.ignore();
+    _queueOut(bytes, done);
+    return done.future;
   }
 
-  Future<void> _sendBytes(Uint8List bytes) async {
-    for (var offset = 0; offset < bytes.length; offset += maxChunk) {
-      if (isFinished) {
-        throw StateError('セッションは終了しています');
+  /// フレームを送信待ちに積むだけで、書き終えるのは待たない（お知らせを続けて
+  /// 送るとき、書き込みを詰めるため）。積みすぎないよう [_waitDrain] と組にする。
+  void _bufferSend(Uint8List bytes) {
+    final err = _sendError;
+    if (err != null) {
+      throw err;
+    }
+    _queueOut(bytes, null);
+  }
+
+  /// 送信待ちが 2 チャンク分を超えている間だけ待つ。
+  Future<void> _waitDrain() async {
+    while (_outBuffered > maxChunk * 2 && _sendError == null) {
+      await (_drained ??= Completer<void>()).future;
+    }
+    final err = _sendError;
+    if (err != null) {
+      throw err;
+    }
+  }
+
+  void _queueOut(Uint8List bytes, Completer<void>? done) {
+    _out.add((bytes: bytes, done: done));
+    _outBuffered += bytes.length;
+    if (!_pumping) {
+      _pumping = true;
+      unawaited(_pump());
+    }
+  }
+
+  void _wakeDrained() {
+    final d = _drained;
+    if (d != null && (_outBuffered <= maxChunk * 2 || _sendError != null)) {
+      _drained = null;
+      d.complete();
+    }
+  }
+
+  /// 送信待ちを先頭から maxChunk ずつ詰めて書く。フレームの境目はまたいでよい
+  /// （受け手はバイト列としてつなげてから区切る）。
+  Future<void> _pump() async {
+    var finished = <Completer<void>>[];
+    try {
+      while (_out.isNotEmpty) {
+        if (isFinished) {
+          throw StateError('セッションは終了しています');
+        }
+        final b = BytesBuilder(copy: false);
+        finished = <Completer<void>>[];
+        while (b.length < maxChunk && _out.isNotEmpty) {
+          final head = _out.first;
+          final rest = head.bytes.length - _outOffset;
+          final room = maxChunk - b.length;
+          final take = rest < room ? rest : room;
+          b.add(Uint8List.sublistView(head.bytes, _outOffset, _outOffset + take));
+          _outOffset += take;
+          if (_outOffset == head.bytes.length) {
+            _out.removeFirst();
+            _outOffset = 0;
+            final done = head.done;
+            if (done != null) {
+              finished.add(done);
+            }
+          }
+        }
+        final data = b.takeBytes();
+        await _send(data);
+        _bytesSent += data.length;
+        _outBuffered -= data.length;
+        for (final c in finished) {
+          c.complete();
+        }
+        finished = <Completer<void>>[];
+        _wakeDrained();
       }
-      final end =
-          offset + maxChunk < bytes.length ? offset + maxChunk : bytes.length;
-      await _send(bytes.sublist(offset, end));
-      _bytesSent += end - offset;
+    } on Object catch (e, st) {
+      _sendError = e;
+      for (final c in finished) {
+        c.completeError(e, st);
+      }
+      for (final item in _out) {
+        item.done?.completeError(e, st);
+      }
+      _out.clear();
+      _outOffset = 0;
+      _outBuffered = 0;
+      _wakeDrained();
+      _fail('送信エラー: $e');
+    } finally {
+      _pumping = false;
     }
   }
 
@@ -667,21 +781,40 @@ class SyncSession {
       _logLine('不正な封筒を破棄: ${e.message}');
       return;
     }
+    _firstMessageAfter ??= _watch.elapsed;
     _receivedIds.add(envelope.msgId);
     final nextHop = envelope.hop + 1 > kMaxHopValue
         ? kMaxHopValue
         : envelope.hop + 1;
     final relayed = envelope.copyWith(hop: nextHop);
-    _storeQueue = _storeQueue.then((_) async {
-      try {
-        final result = await _store.add(relayed, now: _now());
-        if (result == AddResult.added) {
-          _messagesReceived++;
+    _pendingStores.add(relayed);
+    if (!_storing) {
+      _storing = true;
+      _storeQueue = _drainStores();
+    }
+  }
+
+  Future<void> _drainStores() async {
+    try {
+      while (_pendingStores.isNotEmpty) {
+        final batch = List<Envelope>.of(_pendingStores);
+        _pendingStores.clear();
+        try {
+          _messagesReceived += await _store.addAll(batch, now: _now());
+        } on Object catch (e) {
+          _logLine('保存に失敗: $e');
         }
-      } on Object catch (e) {
-        _logLine('保存に失敗: $e');
       }
-    });
+    } finally {
+      _storing = false;
+    }
+  }
+
+  /// 受け取った封筒をすべて保存し終えるまで待つ。
+  Future<void> _waitStores() async {
+    while (_storing) {
+      await _storeQueue;
+    }
   }
 
   void _onMessagesEnd() {
@@ -719,7 +852,7 @@ class SyncSession {
   }
 
   Future<void> _finishAsInitiator() async {
-    await _storeQueue;
+    await _waitStores();
     if (isFinished) {
       return;
     }
@@ -733,7 +866,7 @@ class SyncSession {
   }
 
   Future<void> _finishAfterStores({required bool success}) async {
-    await _storeQueue;
+    await _waitStores();
     if (isFinished) {
       return;
     }
@@ -799,6 +932,7 @@ class SyncSession {
   }
 
   void _finish(SessionState finalState, String? reason) {
+    _watch.stop();
     _helloTimer?.cancel();
     _sessionTimer?.cancel();
     _helloTimer = null;

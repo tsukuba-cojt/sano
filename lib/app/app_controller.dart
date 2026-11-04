@@ -3,6 +3,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
@@ -19,6 +20,8 @@ import '../mesh/message_store.dart';
 import '../mesh/store_file.dart';
 import '../mesh/sync_session.dart' show TimerFactory;
 import '../mesh/transport.dart';
+import 'handed_log.dart';
+import 'test_data.dart';
 import '../transport/ble_transport.dart';
 import '../transport/hub_transport.dart';
 
@@ -131,6 +134,7 @@ class AppSettings {
     this.chimeEnabled = true,
     this.lastSyncAt,
     this.lastOpenedAt,
+    this.developerMode = false,
   });
 
   /// 表示名（住民投稿の発信元名）。空なら「名前なし」。
@@ -163,6 +167,9 @@ class AppSettings {
   /// 最後にアプリを開いた時刻（エポック秒、C07）。
   int? lastOpenedAt;
 
+  /// 開発者メニュー（実機テスト用のデータ投入）を出すか（#152）。
+  bool developerMode;
+
   /// 新しいお知らせを OS の通知で知らせるか（[notificationLevel] の短縮）。
   bool get notificationsEnabled => notificationLevel != NotificationLevel.off;
   set notificationsEnabled(bool v) {
@@ -186,6 +193,7 @@ class AppSettings {
         chimeEnabled: chimeEnabled,
         lastSyncAt: lastSyncAt,
         lastOpenedAt: lastOpenedAt,
+        developerMode: developerMode,
       );
 
   Map<String, Object?> toJson() => <String, Object?>{
@@ -200,6 +208,7 @@ class AppSettings {
         'chimeEnabled': chimeEnabled,
         'lastSyncAt': lastSyncAt,
         'lastOpenedAt': lastOpenedAt,
+        'developerMode': developerMode,
       };
 
   static AppSettings fromJson(Map<String, Object?> json) {
@@ -227,6 +236,7 @@ class AppSettings {
       chimeEnabled: (json['chimeEnabled'] as bool?) ?? true,
       lastSyncAt: json['lastSyncAt'] as int?,
       lastOpenedAt: json['lastOpenedAt'] as int?,
+      developerMode: (json['developerMode'] as bool?) ?? false,
     );
   }
 }
@@ -437,6 +447,7 @@ class AppController extends ChangeNotifier {
   /// 永続化キー。
   static const String settingsKey = 'settings.v1';
   static const String nodeIdKey = 'node.id';
+  static const String handedKey = 'handed.v1';
 
   /// docs/03 §4: ネイティブ側と共有する「開始済み」フラグ。
   static const String meshEnabledKey = 'mesh.enabled';
@@ -456,6 +467,7 @@ class AppController extends ChangeNotifier {
 
   AppSettings _settings = AppSettings();
   MeshNode? _node;
+  HandedLog _handed = HandedLog();
   Uint8List? _nodeId;
   Timer? _purgeTimer;
   Timer? _keepScreenTimer;
@@ -599,6 +611,7 @@ class AppController extends ChangeNotifier {
     await _loadNodeId();
     await _groups.load();
     await _store.load();
+    await _loadHanded();
     _store.joinedGroupIds = _groups.codes;
     _store.officialGroupIds = _groups.officialCodes;
     // 起動時点で保存されていたものは「新着」ではない（通知しない）。
@@ -612,6 +625,7 @@ class AppController extends ChangeNotifier {
       now: _now,
       createTimer: _createTimer,
       onSyncCompleted: _onSyncCompleted,
+      onHanded: _onHanded,
     );
     node.setRelayMode(_settings.relayMode);
     _node = node;
@@ -641,7 +655,11 @@ class AppController extends ChangeNotifier {
   }
 
   void _onPurgeTick() {
-    unawaited(_store.purgeExpired(_now()));
+    unawaited(_store.purgeExpired(_now()).then((_) {
+      if (_handed.prune(_store.contains)) {
+        unawaited(_persistHanded());
+      }
+    }));
     unawaited(refreshBattery());
     if (_createTimer != null && _initialized) {
       _purgeTimer = _createTimer(kPurgeInterval, _onPurgeTick);
@@ -705,6 +723,66 @@ class AppController extends ChangeNotifier {
       unawaited(_platform?.playChime());
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // この端末から 渡した 台数（C18）
+  // ---------------------------------------------------------------------------
+
+  /// 台数を数えるお知らせか: 自分の投稿と、公式端末なら同じグループの公式投稿。
+  bool _tracksHanded(StoredMessage m) {
+    if (m.kind != MessageKind.notice) {
+      return false;
+    }
+    if (m.isLocal) {
+      return true;
+    }
+    return m.envelope.role == SenderRole.official &&
+        (_groups.byCode(m.groupId)?.postRole ?? SenderRole.resident) ==
+            SenderRole.official;
+  }
+
+  void _onHanded(String peerHex, List<int> sentIds, int at) {
+    _handed.record(
+      peerHex: peerHex,
+      msgIds: sentIds,
+      at: at,
+      tracked: (id) {
+        final m = _store.get(id);
+        return m != null && _tracksHanded(m);
+      },
+    );
+    unawaited(_persistHanded());
+    notifyListeners();
+  }
+
+  /// [m] を この端末から 直接 渡した 台数。数える対象でなければ null。
+  HandedInfo? handedOf(StoredMessage m) =>
+      _tracksHanded(m) ? _handed.of(m.msgId) : null;
+
+  /// これまでに この端末から 何かを 渡した 相手の 台数。
+  int get handedDeviceCount => _handed.deviceCount;
+
+  /// 最後に 渡した 時刻（エポック秒）と件数。まだなければ時刻は null。
+  int? get lastHandedAt => _handed.lastAt;
+  int get lastHandedCount => _handed.lastCount;
+
+  Future<void> _loadHanded() async {
+    final raw = await _kv.getString(handedKey);
+    if (raw == null) {
+      return;
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, Object?>) {
+        _handed = HandedLog.fromJson(decoded);
+      }
+    } on Object catch (_) {
+      // 壊れていたら数え直す。
+    }
+  }
+
+  Future<void> _persistHanded() =>
+      _kv.setString(handedKey, jsonEncode(_handed.toJson()));
 
   // ---------------------------------------------------------------------------
   // 新しいお知らせの OS 通知
@@ -786,7 +864,10 @@ class AppController extends ChangeNotifier {
     final visible = _store.visibleNotices(now: _now(), groupIds: _groups.codes);
     final fresh = <StoredMessage>[];
     for (final m in visible) {
-      if (_knownNoticeIds.add(m.msgId) && !m.isLocal && !m.read) {
+      if (_knownNoticeIds.add(m.msgId) &&
+          !m.isLocal &&
+          !m.read &&
+          !isTestEnvelope(m.envelope)) {
         fresh.add(m);
       }
     }
@@ -1041,7 +1122,8 @@ class AppController extends ChangeNotifier {
           continue;
         }
         _knownReportIds.add(m.msgId);
-        if (_store.isDisplayable(m, now)) {
+        if (_store.isDisplayable(m, now) &&
+            !isTestEnvelope(m.envelope)) {
           freshReports.add(m);
         }
       } else {
@@ -2128,6 +2210,78 @@ class AppController extends ChangeNotifier {
   /// 掲示番号（msg_id の下位 20 ビットを 10 進 6 桁、紙との突き合わせ用、C19）。
   static String bulletinNumber(int msgId) =>
       (msgId & 0xFFFFF).toString().padLeft(6, '0');
+
+  // ---------------------------------------------------------------------------
+  // 開発者メニュー（実機テスト用のデータ、#152）
+  // ---------------------------------------------------------------------------
+
+  /// 開発者メニューを出す／隠す。
+  Future<void> setDeveloperMode(bool v) async {
+    if (_settings.developerMode == v) {
+      return;
+    }
+    _settings.developerMode = v;
+    await _persistSettings();
+    notifyListeners();
+  }
+
+  /// この端末にあるテスト用データ（発信元が "TEST"）の件数。
+  int get testDataCount =>
+      _store.all.where((m) => isTestEnvelope(m.envelope)).length;
+
+  /// テスト用のお知らせを [count] 件入れる（TD1〜TD3）。受け取ったものとして
+  /// 保存し（自分の投稿扱いにしない）、既読にする。入った件数を返す。
+  Future<int> addTestNotices({
+    required int groupCode,
+    required int count,
+    TestBody body = TestBody.plain,
+  }) {
+    final now = _now();
+    return _addTestData(makeTestNotices(
+      count: count,
+      groupId: groupCode,
+      now: now,
+      random: Random(),
+      body: body,
+      startIndex: testDataCount + 1,
+    ));
+  }
+
+  /// 保存の上限（3,000 件）まで、ばらばらの文字のお知らせで埋める（TD4）。
+  Future<int> fillTestNotices({required int groupCode}) {
+    final room = _store.maxMessages - _store.count;
+    if (room <= 0) {
+      return Future<int>.value(0);
+    }
+    return addTestNotices(
+        groupCode: groupCode, count: room, body: TestBody.noise);
+  }
+
+  /// テスト用の住民からの知らせを [count] 件入れる（TD5 の「無事です 100 件」など）。
+  Future<int> addTestReports({
+    required int groupCode,
+    required int count,
+    ReportType type = ReportType.safe,
+  }) {
+    return _addTestData(makeTestReports(
+      count: count,
+      groupId: groupCode,
+      now: _now(),
+      random: Random(),
+      type: type,
+    ));
+  }
+
+  Future<int> _addTestData(List<Envelope> envelopes) async {
+    final added = await _store.addAll(envelopes, now: _now());
+    await _store.markAllRead({for (final e in envelopes) e.msgId});
+    _node?.nudge();
+    return added;
+  }
+
+  /// テスト用データをこの端末から消す（ほかの端末には残る）。消した件数を返す。
+  Future<int> removeTestData() =>
+      _store.removeWhere((m) => isTestEnvelope(m.envelope));
 
   // ---------------------------------------------------------------------------
   // 補助

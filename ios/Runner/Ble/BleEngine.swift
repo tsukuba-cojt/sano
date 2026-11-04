@@ -1,4 +1,7 @@
 import CoreBluetooth
+
+/// 1 回に書ける・通知できる上限。Android の GATT は属性値を 512 バイトまでしか扱わない。
+let kMaxAttributeLength = 512
 import Foundation
 import os
 #if os(iOS)
@@ -148,6 +151,9 @@ final class BleEngine: NSObject {
     var pendingWrite: (data: Data, completion: (Error?) -> Void)?
     /// 前回の購読が残っていたので解除 → 再購読をしたか（1 回だけ）。
     var resubscribed = false
+    /// 今回の購読を頼んだか。頼んだ後、購読完了の前に届いた通知は [earlyData] に溜める。
+    var subscribeRequested = false
+    var earlyData: [Data] = []
 
     init(linkId: Int, peripheral: CBPeripheral) {
       self.linkId = linkId
@@ -881,11 +887,14 @@ final class BleEngine: NSObject {
     let link = PeripheralLink(linkId: allocateLinkId(), central: central)
     peripheralLinks[central.identifier] = link
     linkIndex[link.linkId] = .peripheral(central.identifier)
-    log("linkOpened: link=\(link.linkId) peripheral側 maxChunk=\(central.maximumUpdateValueLength)")
+    // 相手が Android だと MTU 517 で 514 になるが、Android の GATT は属性値を
+    // 512 バイトまでしか扱わないので 512 で切る（#152）。
+    let maxChunk = min(central.maximumUpdateValueLength, kMaxAttributeLength)
+    log("linkOpened: link=\(link.linkId) peripheral側 maxChunk=\(maxChunk)")
     emit(.linkOpened(
       linkId: link.linkId,
       peerId: central.identifier.uuidString,
-      maxChunk: central.maximumUpdateValueLength,
+      maxChunk: maxChunk,
       initiator: false))
   }
 
@@ -941,7 +950,7 @@ final class BleEngine: NSObject {
         completion(BleError(code: "notOpen", message: "リンクが開いていません"))
         return
       }
-      guard data.count <= link.central.maximumUpdateValueLength else {
+      guard data.count <= min(link.central.maximumUpdateValueLength, kMaxAttributeLength) else {
         completion(BleError(code: "tooLarge", message: "maxChunk を超えています"))
         return
       }
@@ -1121,6 +1130,7 @@ extension BleEngine: CBPeripheralDelegate {
       log("notify: 前回の購読が残っているので購読し直す link=\(link.linkId)")
       peripheral.setNotifyValue(false, for: tx)
     } else {
+      link.subscribeRequested = true
       peripheral.setNotifyValue(true, for: tx)
     }
   }
@@ -1140,7 +1150,7 @@ extension BleEngine: CBPeripheralDelegate {
       link.opened = true
       link.timer?.cancel()
       link.timer = nil
-      let maxChunk = peripheral.maximumWriteValueLength(for: .withoutResponse)
+      let maxChunk = min(peripheral.maximumWriteValueLength(for: .withoutResponse), kMaxAttributeLength)
       rememberKnownPeer(peripheral, now: Date())
       log("linkOpened: link=\(link.linkId) central側 maxChunk=\(maxChunk)")
       emit(.linkOpened(
@@ -1148,19 +1158,31 @@ extension BleEngine: CBPeripheralDelegate {
         peerId: peripheral.identifier.uuidString,
         maxChunk: maxChunk,
         initiator: true))
+      // 相手は購読を受けた直後に HELLO を送るので、購読完了より先に届くことがある（#152）。
+      for chunk in link.earlyData {
+        emit(.data(linkId: link.linkId, data: chunk))
+      }
+      link.earlyData.removeAll()
     } else if link.opened {
       closeCentralLink(link, reason: "notifyStopped")
     } else if link.resubscribed {
       // 解除が完了したので購読し直す
       link.resubscribed = false
+      link.subscribeRequested = true
       peripheral.setNotifyValue(true, for: characteristic)
     }
   }
 
   func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-    guard let link = centralLinks[peripheral.identifier], link.opened, characteristic.uuid == txUUID,
+    guard let link = centralLinks[peripheral.identifier], characteristic.uuid == txUUID,
       error == nil, let value = characteristic.value, !value.isEmpty
     else { return }
+    guard link.opened else {
+      if link.subscribeRequested && link.earlyData.count < 64 {
+        link.earlyData.append(value)
+      }
+      return
+    }
     emit(.data(linkId: link.linkId, data: value))
   }
 

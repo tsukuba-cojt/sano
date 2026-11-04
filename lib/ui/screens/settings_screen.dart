@@ -1,6 +1,8 @@
 /// 設定画面（docs/08 C04 C05 C06 C11）。
 library;
 
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:kairanban/app/app_controller.dart';
@@ -39,6 +41,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _nameCtl;
   late final Listenable _listenable;
   bool _busy = false;
+  int _versionTaps = 0;
 
   AppController get _c => widget.controller;
 
@@ -56,6 +59,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void dispose() {
     _nameCtl.dispose();
     super.dispose();
+  }
+
+  /// バージョンを 7 回 押すと開発者メニューを出す（実機テスト用、#152）。
+  void _onVersionTap() {
+    if (_c.settings.developerMode) {
+      return;
+    }
+    _versionTaps++;
+    if (_versionTaps < 7) {
+      return;
+    }
+    _versionTaps = 0;
+    unawaited(_c.setDeveloperMode(true));
+    showSnack(context, '開発者メニューを 出しました（通信の状態の 下）');
   }
 
   Future<void> _run(Future<void> Function() action, {String? done}) async {
@@ -520,9 +537,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 onPressed: () => openDiagnostics(context, _c),
               ),
 
+              if (settings.developerMode) ...[
+                const SizedBox(height: 8),
+                SecondaryButton(
+                  label: '開発者メニュー',
+                  onPressed: () => openDeveloperMenu(context, _c),
+                ),
+              ],
+
               // ---- このアプリについて ----
               const SectionTitle('このアプリについて'),
-              const Text('回覧板 バージョン $kAppVersionLabel', style: KairanTextStyles.body),
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _onVersionTap,
+                child: const Text(
+                  '回覧板 バージョン $kAppVersionLabel',
+                  style: KairanTextStyles.body,
+                ),
+              ),
               const SizedBox(height: 4),
               const Text(
                 '近くの スマホと Bluetooth で お知らせを 交換します。インターネットは 使いません。',

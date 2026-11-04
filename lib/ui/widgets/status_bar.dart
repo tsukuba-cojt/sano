@@ -28,6 +28,7 @@ class MeshStatusBar extends StatelessWidget {
     this.onStopKeepScreenOn,
     this.relayMode = false,
     this.lastSentAt,
+    this.lastSentCount = 0,
     this.storeCount = 0,
     this.groupSummary = '',
     this.inForeground = true,
@@ -65,6 +66,9 @@ class MeshStatusBar extends StatelessWidget {
   /// 中継役の大きな表示。
   final bool relayMode;
   final DateTime? lastSentAt;
+
+  /// 最後の交換で渡した件数（C18）。0 なら出さない。
+  final int lastSentCount;
   final int storeCount;
   final String groupSummary;
   final bool inForeground;
@@ -211,7 +215,8 @@ class MeshStatusBar extends StatelessWidget {
       ..write(' ・ ')
       ..write(sent == null
           ? 'まだ 渡していません'
-          : '最後に 渡したのは ${describeTime(sent, nowTime)}');
+          : '最後に 渡したのは ${describeTime(sent, nowTime)}'
+              '${lastSentCount > 0 ? '（${formatCountJa(lastSentCount, '件')}）' : ''}');
     final alert = alertLine;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,

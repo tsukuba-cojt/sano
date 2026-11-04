@@ -127,6 +127,29 @@ void main() {
     await radio.settle();
   }
 
+  test('続けて送るお知らせは 1 回の書き込みに詰める（maxChunk いっぱいまで）', () async {
+    radio = FakeRadio(
+        clock: FakeClock(startEpochSeconds: kT0), defaultMaxChunk: 512);
+    a = Peer(radio, 'A', index: 1);
+    b = Peer(radio, 'B', index: 2);
+    final t = radio.clock.now();
+    for (var i = 0; i < 40; i++) {
+      await a.store.add(
+          makeNotice(origin: a.nodeId, createdAt: t - 100 + i, text: '水$i'),
+          now: t,
+          isLocal: true);
+    }
+    await connectAB();
+    expect(b.store.count, 40);
+    expect(b.session.messagesReceived, 40);
+    final total = b.received.fold<int>(0, (n, c) => n + c.length);
+    expect(b.received.every((c) => c.length <= 512), isTrue);
+    // 1 件ずつ書けば 40 回を超える。詰めればほぼ total / 512 回。
+    expect(b.received.length, lessThan(total ~/ 512 + 8));
+    expect(framesOf(b.received).where((f) => f.type == FrameType.message).length,
+        40);
+  });
+
   test('ばらばらな在庫の 2 ノードが同期後に同じ内容になり、開始側が閉じる', () async {
     a = Peer(radio, 'A', index: 1);
     b = Peer(radio, 'B', index: 2);
@@ -191,7 +214,9 @@ void main() {
     expect(b.transport.openLinkIds, isEmpty);
     expect(a.closed.length, 1);
     expect(b.closed.length, 1);
-    expect(radio.log.any((l) => l.startsWith('closed A#')), isTrue);
+    // 開始側は BYE を書き終えたら閉じ、応答側も BYE を受けたら閉じる（どちらが
+    // 先でもよい。送信をまとめて書くようにしてから順は決まらない）。
+    expect(radio.log.where((l) => l.startsWith('closed ')).length, 1);
     // 送った MESSAGE の優先順: group_info が先。
     final messagesAtA = framesOf(a.received)
         .where((f) => f.type == FrameType.message)
