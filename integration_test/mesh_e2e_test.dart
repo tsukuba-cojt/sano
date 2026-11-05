@@ -39,11 +39,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:kairanban/app/app_controller.dart';
+import 'package:kairanban/app/test_data.dart';
 import 'package:kairanban/core/categories.dart';
 import 'package:kairanban/core/envelope.dart';
 import 'package:kairanban/mesh/groups.dart';
+import 'package:kairanban/mesh/mesh_node.dart';
 import 'package:kairanban/mesh/message_store.dart';
 import 'package:kairanban/ui/app.dart';
+import 'package:kairanban/ui/screens/diagnostics_screen.dart';
 import 'package:kairanban/ui/widgets/six_digit_input.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -304,6 +307,9 @@ Future<void> _demoFlow(WidgetTester tester, AppController controller) async {
   final deadline = DateTime.now().add(Duration(minutes: kDemoMinutes));
   final supportDir = await getApplicationSupportDirectory();
   final requestFile = File('${supportDir.path}/post_request.txt');
+  // 実機テスト用のデータ（#152）。1 行目が「30」「300」「1500」（ばらばらの文字）
+  // 「fill」（上限まで）「clear」（テスト用データを消す）。
+  final testDataFile = File('${supportDir.path}/testdata_request.txt');
 
   // 前回のグループがあればそれを使い、なければ作る。
   JoinedGroup? group;
@@ -387,6 +393,9 @@ Future<void> _demoFlow(WidgetTester tester, AppController controller) async {
   var lastPost = DateTime.now();
   var lastStatus = DateTime.now();
   var lastSessions = controller.node.totalSessions;
+  SessionStat? lastLoggedStat = controller.node.recentSessions.isEmpty
+      ? null
+      : controller.node.recentSessions.last;
   var postIndex = 0;
   const categories = <NoticeCategory>[
     NoticeCategory.water,
@@ -444,10 +453,49 @@ Future<void> _demoFlow(WidgetTester tester, AppController controller) async {
       }
     }
 
-    // 届いたもの。
+    // テスト用データの依頼。
+    if (testDataFile.existsSync()) {
+      try {
+        final order = testDataFile.readAsStringSync().trim();
+        testDataFile.deleteSync();
+        final watch = Stopwatch()..start();
+        final int n;
+        switch (order) {
+          case 'fill':
+            n = await controller.fillTestNotices(groupCode: group.code);
+          case 'clear':
+            n = await controller.removeTestData();
+          case '1500':
+            n = await controller.addTestNotices(
+                groupCode: group.code, count: 1500, body: TestBody.noise);
+          default:
+            n = await controller.addTestNotices(
+                groupCode: group.code, count: int.parse(order));
+        }
+        for (final m in controller.notices()) {
+          seen.add(m.envelope.msgId);
+        }
+        _log('テスト用データ $order: $n 件（${watch.elapsedMilliseconds} ms）'
+            ' 保存=${controller.store.count}件 テスト用=${controller.testDataCount}件');
+      } catch (e) {
+        _log('テスト用データの依頼に失敗: $e');
+      }
+    }
+
+    // 交換 1 回ごとの量と秒数（通信の状態と同じ形）。
+    final stats = controller.node.recentSessions;
+    if (stats.isNotEmpty && !identical(stats.last, lastLoggedStat)) {
+      final start = stats.indexWhere((x) => identical(x, lastLoggedStat)) + 1;
+      for (final st in stats.skip(start)) {
+        _log('交換: ${DiagnosticsScreen.sessionLine(st)}');
+      }
+      lastLoggedStat = stats.last;
+    }
+
+    // 届いたもの（テスト用データは数だけ）。
     for (final m in controller.notices()) {
       if (!seen.add(m.envelope.msgId)) continue;
-      if (m.isLocal) continue;
+      if (m.isLocal || isTestEnvelope(m.envelope)) continue;
       final n = m.envelope.notice;
       _log('★ 受信: 「${n?.title}」 from ${n?.senderName} '
           'hop=${m.envelope.hop} ${_categoryLabel(m.envelope.category)}');
