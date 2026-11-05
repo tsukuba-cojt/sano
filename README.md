@@ -24,6 +24,7 @@
 | [docs/05_dart_api.md](docs/05_dart_api.md) | Dart 内部 API |
 | [docs/06_prior_art_and_novelty.md](docs/06_prior_art_and_novelty.md) | 先行事例（国内外の類似アプリ・研究・特許）と新規性の評価 |
 | [docs/07_regulations.md](docs/07_regulations.md) | 関係する規制・ストア要件（Google Play / App Store / 日本の法令・ガイドライン）と対応状況 |
+| [docs/09_operations.md](docs/09_operations.md) | 運用手引き（下書き）: 平時の準備とコードの扱い、中継役の置き方、運び役、住民からの知らせ、公式の書き方、訓練、デマ対応、掲示の紙。実測待ちの値は実機テストで埋める（C16） |
 | [docs/08_use_cases.md](docs/08_use_cases.md) | ユースケース 74 件（誰が・いつ・何を、現行の ◯△✕）と v2 の仕様変更 C01〜C25（確定仕様・導入順・落とした案・変えないこと） |
 
 ## ビルド
