@@ -75,6 +75,7 @@ class ReportCard extends StatelessWidget {
     this.note = '',
     this.isReply = false,
     this.timeLabel = '届いた',
+    this.historical = false,
   });
 
   final ReportType type;
@@ -92,6 +93,7 @@ class ReportCard extends StatelessWidget {
   /// 受け取りの状態の 1 行。
   final String stateLine;
   final bool acked;
+  final bool historical;
 
   /// 安否確認への返事か。
   final bool isReply;
@@ -99,7 +101,7 @@ class ReportCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final sosOpen = type == ReportType.sos && !acked;
+    final sosOpen = type == ReportType.sos && !acked && !historical;
     final semantics = StringBuffer()
       ..write('${type.shortLabel}、')
       ..write(isReply ? '安否確認への 返事、' : '')

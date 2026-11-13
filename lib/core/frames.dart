@@ -43,6 +43,9 @@ const int kCapPush = 0x08;
 /// 双方が立てているときだけ、msg_id の列の代わりに要約を送る。
 const int kCapInventoryFilter = 0x10;
 
+/// HELLO caps bit5: 受信内容の永続保存を STORED で確認する。
+const int kCapStoreConfirmation = 0x20;
+
 /// MESSAGES_END payload bit0: 送信上限で打ち切った（続きがある）。
 const int kMessagesEndMore = 0x01;
 
@@ -51,7 +54,8 @@ const int kMessagesEndMore = 0x01;
 const int kMessagesEndPollMe = 0x02;
 
 /// この実装が常に立てる caps。
-const int kDefaultCaps = kCapRelayUnknown | kCapPush | kCapInventoryFilter;
+const int kDefaultCaps =
+    kCapRelayUnknown | kCapPush | kCapInventoryFilter | kCapStoreConfirmation;
 
 /// フレームの種類。
 enum FrameType {
@@ -69,6 +73,9 @@ enum FrameType {
   inventoryFilter(0x06),
   message(0x10),
   messagesEnd(0x11),
+
+  /// 保存確認: flags(u8, bit0=最後) ‖ count(u16) ‖ msg_id × count。
+  stored(0x12),
   bye(0x20);
 
   const FrameType(this.code);
@@ -114,7 +121,10 @@ class Frame {
     final length = 1 + payload.length;
     if (length > kMaxFrameLength) {
       throw ArgumentError.value(
-          payload.length, 'payload', '$kMaxFramePayloadBytes バイトを超えています');
+        payload.length,
+        'payload',
+        '$kMaxFramePayloadBytes バイトを超えています',
+      );
     }
     if (rawType < 0 || rawType > 0xFF) {
       throw ArgumentError.value(rawType, 'rawType', '0..255');
@@ -144,7 +154,8 @@ class Frame {
     final count = storeCount.clamp(0, 0xFFFF);
     final withGroups = groups.isNotEmpty;
     final payload = Uint8List(
-        kHelloPayloadLength + (withGroups ? 1 + 3 * groups.length : 0));
+      kHelloPayloadLength + (withGroups ? 1 + 3 * groups.length : 0),
+    );
     payload[0] = kProtocolVersionForHello;
     payload.setRange(1, 9, nodeId);
     payload[9] = count & 0xFF;
@@ -168,8 +179,11 @@ class Frame {
   /// [inventoryFrames] で分割する）。
   static Frame inventory(List<int> msgIds) {
     if (msgIds.length > kMaxInventoryPerFrame) {
-      throw ArgumentError.value(msgIds.length, 'msgIds',
-          '1 フレームには $kMaxInventoryPerFrame 件までです');
+      throw ArgumentError.value(
+        msgIds.length,
+        'msgIds',
+        '1 フレームには $kMaxInventoryPerFrame 件までです',
+      );
     }
     final payload = Uint8List(2 + msgIds.length * 8);
     payload[0] = msgIds.length & 0xFF;
@@ -193,7 +207,8 @@ class Frame {
     return frames;
   }
 
-  static Frame inventoryEnd() => Frame(FrameType.inventoryEnd.code, Uint8List(0));
+  static Frame inventoryEnd() =>
+      Frame(FrameType.inventoryEnd.code, Uint8List(0));
 
   /// INVENTORY_FILTER（payload は [InventoryFilter.encode] の結果、v2.3）。
   static Frame inventoryFilter(Uint8List payload) =>
@@ -230,12 +245,22 @@ class Frame {
   static bool messagesEndPollMe(Uint8List payload) =>
       payload.isNotEmpty && (payload[0] & kMessagesEndPollMe) != 0;
 
+  /// 永続保存できた ID。最後は空の [msgIds] と [last] で示す。
+  static Frame stored(List<int> msgIds, {bool last = false}) {
+    final inventoryPayload = inventory(msgIds).payload;
+    final payload = Uint8List(1 + inventoryPayload.length);
+    payload[0] = last ? 1 : 0;
+    payload.setRange(1, payload.length, inventoryPayload);
+    return Frame(FrameType.stored.code, payload);
+  }
+
   static Frame bye() => Frame(FrameType.bye.code, Uint8List(0));
 
   static Uint8List _u32(int value) {
     final out = Uint8List(4);
-    ByteData.sublistView(out)
-        .setUint32(0, value.clamp(0, 0xFFFFFFFF), Endian.little);
+    ByteData.sublistView(
+      out,
+    ).setUint32(0, value.clamp(0, 0xFFFFFFFF), Endian.little);
     return out;
   }
 
@@ -285,8 +310,7 @@ class HelloInfo {
   /// 将来の拡張のため、読めない余分は無視する。
   static HelloInfo parse(Uint8List payload) {
     if (payload.length < kHelloPayloadLength) {
-      throw FrameFormatException(
-          'HELLO が短すぎます（${payload.length} バイト）');
+      throw FrameFormatException('HELLO が短すぎます（${payload.length} バイト）');
     }
     final caps = payload[11];
     final groups = <int>[];
@@ -297,9 +321,11 @@ class HelloInfo {
         if (payload.length - offset < 3) {
           break;
         }
-        groups.add(payload[offset] |
-            (payload[offset + 1] << 8) |
-            (payload[offset + 2] << 16));
+        groups.add(
+          payload[offset] |
+              (payload[offset + 1] << 8) |
+              (payload[offset + 2] << 16),
+        );
         offset += 3;
       }
     }
@@ -327,7 +353,8 @@ List<int> parseInventory(Uint8List payload) {
   final count = payload[0] | (payload[1] << 8);
   if (payload.length - 2 < count * 8) {
     throw FrameFormatException(
-        'INVENTORY が短すぎます（count=$count、${payload.length} バイト）');
+      'INVENTORY が短すぎます（count=$count、${payload.length} バイト）',
+    );
   }
   final ids = List<int>.filled(count, 0);
   for (var i = 0; i < count; i++) {
@@ -386,14 +413,16 @@ class FrameParser {
       }
       if (length > kMaxFrameLength) {
         throw FrameFormatException(
-            'length が上限を超えています（$length > $kMaxFrameLength）');
+          'length が上限を超えています（$length > $kMaxFrameLength）',
+        );
       }
       if (_length - start < 2 + length) {
         break;
       }
       final type = _buffer[start + 2];
-      final payload =
-          Uint8List.fromList(_buffer.sublist(start + 3, start + 2 + length));
+      final payload = Uint8List.fromList(
+        _buffer.sublist(start + 3, start + 2 + length),
+      );
       _ready.add(Frame(type, payload));
       start += 2 + length;
     }

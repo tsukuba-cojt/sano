@@ -17,6 +17,7 @@ import '../core/report.dart';
 import '../mesh/groups.dart';
 import '../mesh/mesh_node.dart';
 import '../mesh/message_store.dart';
+import '../mesh/report_inbox.dart';
 import '../mesh/store_file.dart';
 import '../mesh/sync_session.dart' show TimerFactory;
 import '../mesh/transport.dart';
@@ -84,6 +85,8 @@ class ReportEntry {
     required this.body,
     required this.info,
     this.ack,
+    this.expired = false,
+    this.replyPending = false,
   });
 
   final StoredMessage message;
@@ -92,6 +95,8 @@ class ReportEntry {
 
   /// 「受け取りました」。まだなら null。
   final StoredMessage? ack;
+  final bool expired;
+  final bool replyPending;
 
   int get msgId => message.msgId;
   int get groupId => message.groupId;
@@ -183,33 +188,33 @@ class AppSettings {
   }
 
   AppSettings copy() => AppSettings(
-        displayName: displayName,
-        textScale: textScale,
-        lowPowerPreferred: lowPowerPreferred,
-        onboardingDone: onboardingDone,
-        meshEnabled: meshEnabled,
-        notificationLevel: notificationLevel,
-        relayMode: relayMode,
-        chimeEnabled: chimeEnabled,
-        lastSyncAt: lastSyncAt,
-        lastOpenedAt: lastOpenedAt,
-        developerMode: developerMode,
-      );
+    displayName: displayName,
+    textScale: textScale,
+    lowPowerPreferred: lowPowerPreferred,
+    onboardingDone: onboardingDone,
+    meshEnabled: meshEnabled,
+    notificationLevel: notificationLevel,
+    relayMode: relayMode,
+    chimeEnabled: chimeEnabled,
+    lastSyncAt: lastSyncAt,
+    lastOpenedAt: lastOpenedAt,
+    developerMode: developerMode,
+  );
 
   Map<String, Object?> toJson() => <String, Object?>{
-        'displayName': displayName,
-        'textScale': textScale,
-        'lowPowerPreferred': lowPowerPreferred,
-        'onboardingDone': onboardingDone,
-        'meshEnabled': meshEnabled,
-        'notificationLevel': notificationLevel.name,
-        'notificationsEnabled': notificationsEnabled,
-        'relayMode': relayMode,
-        'chimeEnabled': chimeEnabled,
-        'lastSyncAt': lastSyncAt,
-        'lastOpenedAt': lastOpenedAt,
-        'developerMode': developerMode,
-      };
+    'displayName': displayName,
+    'textScale': textScale,
+    'lowPowerPreferred': lowPowerPreferred,
+    'onboardingDone': onboardingDone,
+    'meshEnabled': meshEnabled,
+    'notificationLevel': notificationLevel.name,
+    'notificationsEnabled': notificationsEnabled,
+    'relayMode': relayMode,
+    'chimeEnabled': chimeEnabled,
+    'lastSyncAt': lastSyncAt,
+    'lastOpenedAt': lastOpenedAt,
+    'developerMode': developerMode,
+  };
 
   static AppSettings fromJson(Map<String, Object?> json) {
     final levelName = json['notificationLevel'] as String?;
@@ -365,15 +370,14 @@ class BleTransportActions implements PlatformActions {
     required int groupCode,
     NoticeImportance importance = NoticeImportance.important,
     int? msgId,
-  }) =>
-      _ble.showNotice(
-        id: id,
-        title: title,
-        body: body,
-        groupCode: groupCode,
-        importance: importance.name,
-        msgId: msgId,
-      );
+  }) => _ble.showNotice(
+    id: id,
+    title: title,
+    body: body,
+    groupCode: groupCode,
+    importance: importance.name,
+    msgId: msgId,
+  );
 
   @override
   Future<void> cancelNotice(int id) => _ble.cancelNotice(id);
@@ -411,7 +415,7 @@ class BleTransportActions implements PlatformActions {
 /// shared_preferences を [KeyValueStore] に合わせる薄いアダプタ。
 class SharedPrefsKeyValueStore implements KeyValueStore {
   SharedPrefsKeyValueStore([SharedPreferencesAsync? prefs])
-      : _prefs = prefs ?? SharedPreferencesAsync();
+    : _prefs = prefs ?? SharedPreferencesAsync();
 
   final SharedPreferencesAsync _prefs;
 
@@ -431,6 +435,7 @@ class AppController extends ChangeNotifier {
   AppController({
     required this._transport,
     required StoreBackend storeBackend,
+    StoreBackend? reportBackend,
     required KeyValueStore kv,
     this._platform,
     int Function()? now,
@@ -438,11 +443,12 @@ class AppController extends ChangeNotifier {
     Uint8List? nodeId,
     this._onMeshEnabledChanged,
     this._onReceived,
-  })  : _kv = kv,
-        _now = now ?? nowEpochSeconds,
-        _presetNodeId = nodeId,
-        _store = MessageStore(storeBackend),
-        _groups = GroupManager(kv);
+  }) : _kv = kv,
+       _now = now ?? nowEpochSeconds,
+       _presetNodeId = nodeId,
+       _store = MessageStore(storeBackend),
+       _inbox = ReportInbox(reportBackend ?? MemoryStoreBackend()),
+       _groups = GroupManager(kv);
 
   /// 永続化キー。
   static const String settingsKey = 'settings.v1';
@@ -463,7 +469,9 @@ class AppController extends ChangeNotifier {
   final Future<void> Function(DateTime at)? _onReceived;
   final Uint8List? _presetNodeId;
   final MessageStore _store;
+  final ReportInbox _inbox;
   final GroupManager _groups;
+  Set<int> _reportGroupIds = {};
 
   AppSettings _settings = AppSettings();
   MeshNode? _node;
@@ -514,6 +522,7 @@ class AppController extends ChangeNotifier {
   static Future<AppController> createDefault() async {
     final dir = await getApplicationSupportDirectory();
     final backend = FileStoreBackend('${dir.path}/messages.bin');
+    final reportBackend = FileStoreBackend('${dir.path}/reports.bin');
     // 開発用: --dart-define=KAIRANBAN_HUB=host:port で TCP ハブ（模擬電波）を使う。
     // iOS シミュレータは BLE 非対応のため、この経路で UI と同期を確認する。
     const hubSpec = String.fromEnvironment('KAIRANBAN_HUB');
@@ -526,6 +535,7 @@ class AppController extends ChangeNotifier {
       return AppController(
         transport: HubTransport(host, port),
         storeBackend: backend,
+        reportBackend: reportBackend,
         kv: SharedPrefsKeyValueStore(),
         platform: const NoopPlatformActions(),
         onMeshEnabledChanged: _mirrorMeshEnabledForNative,
@@ -535,6 +545,7 @@ class AppController extends ChangeNotifier {
     return AppController(
       transport: ble,
       storeBackend: backend,
+      reportBackend: reportBackend,
       kv: SharedPrefsKeyValueStore(),
       platform: BleTransportActions(ble),
       onMeshEnabledChanged: _mirrorMeshEnabledForNative,
@@ -556,6 +567,14 @@ class AppController extends ChangeNotifier {
   bool get isInitialized => _initialized;
   AppSettings get settings => _settings;
   MessageStore get store => _store;
+  ReportInbox get reportInbox => _inbox;
+  String? get storageError {
+    final error = _inbox.lastError ?? _store.lastStorageError;
+    if (error == null) return null;
+    if (error.contains('いっぱい')) return error;
+    return '情報を 保存できていません。端末の 空き容量を 確かめ、近くの 端末と もう一度 交換してください。';
+  }
+
   GroupManager get groups => _groups;
 
   MeshNode get node {
@@ -611,9 +630,14 @@ class AppController extends ChangeNotifier {
     await _loadNodeId();
     await _groups.load();
     await _store.load();
+    await _inbox.load(now: _now());
     await _loadHanded();
     _store.joinedGroupIds = _groups.codes;
     _store.officialGroupIds = _groups.officialCodes;
+    _store.externallyStored = _inbox.containsMessageId;
+    _store.beforeCommit = (staged, additions, now) =>
+        _inbox.capture(staged, additions, now, canSee: canSeeReports);
+    await _backfillInbox();
     // 起動時点で保存されていたものは「新着」ではない（通知しない）。
     _knownNoticeIds.addAll(_store.all.map((m) => m.msgId));
     _knownReportIds.addAll(_store.all.map((m) => m.msgId));
@@ -631,6 +655,7 @@ class AppController extends ChangeNotifier {
     _node = node;
 
     _store.addListener(_onStoreChanged);
+    _inbox.addListener(_onInboxChanged);
     _groups.addListener(_onGroupsChanged);
     node.addListener(_onNodeChanged);
 
@@ -655,11 +680,23 @@ class AppController extends ChangeNotifier {
   }
 
   void _onPurgeTick() {
-    unawaited(_store.purgeExpired(_now()).then((_) {
-      if (_handed.prune(_store.contains)) {
-        unawaited(_persistHanded());
-      }
-    }));
+    unawaited(
+      _inbox.purgeExpired(_now()).catchError((Object e) {
+        debugPrint('本部の記録の整理に失敗しました: $e');
+      }),
+    );
+    unawaited(
+      _store
+          .purgeExpired(_now())
+          .then((_) async {
+            if (_handed.prune(_store.contains)) {
+              await _persistHanded();
+            }
+          })
+          .catchError((Object e) {
+            debugPrint('期限切れの情報の整理に失敗しました: $e');
+          }),
+    );
     unawaited(refreshBattery());
     if (_createTimer != null && _initialized) {
       _purgeTimer = _createTimer(kPurgeInterval, _onPurgeTick);
@@ -668,6 +705,7 @@ class AppController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _initialized = false;
     _purgeTimer?.cancel();
     _purgeTimer = null;
     _noticeTimer?.cancel();
@@ -677,6 +715,7 @@ class AppController extends ChangeNotifier {
     _keepScreenTimer?.cancel();
     _keepScreenTimer = null;
     _store.removeListener(_onStoreChanged);
+    _inbox.removeListener(_onInboxChanged);
     _groups.removeListener(_onGroupsChanged);
     _node?.removeListener(_onNodeChanged);
     _node?.dispose();
@@ -690,9 +729,11 @@ class AppController extends ChangeNotifier {
     if (t != null && t != _reportedReceivedAt) {
       _reportedReceivedAt = t;
       if (report != null) {
-        unawaited(report(dateTimeFromEpoch(t)).catchError((Object e) {
-          debugPrint('受信の通知に失敗: $e');
-        }));
+        unawaited(
+          report(dateTimeFromEpoch(t)).catchError((Object e) {
+            debugPrint('受信の通知に失敗: $e');
+          }),
+        );
       }
     }
     notifyListeners();
@@ -708,6 +749,14 @@ class AppController extends ChangeNotifier {
   void _onGroupsChanged() {
     _store.joinedGroupIds = _groups.codes;
     _store.officialGroupIds = _groups.officialCodes;
+    final reportGroups = {
+      for (final g in _groups.groups)
+        if (g.canManage || g.isStaff) g.code,
+    };
+    if (!setEquals(reportGroups, _reportGroupIds)) {
+      _reportGroupIds = reportGroups;
+      unawaited(_backfillInbox());
+    }
     // 参加した直後に見えるようになったお知らせは「新着」ではなく既知にする
     // （参加操作は前面でしか起きないので、ここでは通知にならない）。
     _checkNewNotices();
@@ -715,11 +764,31 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _onInboxChanged() {
+    if (_initialized) notifyListeners();
+  }
+
+  Future<void> _backfillInbox() async {
+    try {
+      await _inbox.capture(
+        _store,
+        _store.all.toList(),
+        _now(),
+        canSee: canSeeReports,
+      );
+    } catch (e) {
+      // 中継側の記録は残る。保存エラーは画面に出し、次回の昇格・起動で再試行する。
+      debugPrint('本部の記録への移行に失敗しました: $e');
+    }
+  }
+
   /// 同期が完了した（C04 の交換完了音、C07 の最終同期時刻）。
   void _onSyncCompleted(int at, int sent, int received) {
     _settings.lastSyncAt = at;
     unawaited(_persistSettings());
-    if (_settings.relayMode && _settings.chimeEnabled && (sent > 0 || received > 0)) {
+    if (_settings.relayMode &&
+        _settings.chimeEnabled &&
+        (sent > 0 || received > 0)) {
       unawaited(_platform?.playChime());
     }
   }
@@ -952,7 +1021,8 @@ class AppController extends ChangeNotifier {
       NoticeCategory.food,
       NoticeCategory.supply,
     };
-    if (withText.contains(m.envelope.category) && notice.text.trim().isNotEmpty) {
+    if (withText.contains(m.envelope.category) &&
+        notice.text.trim().isNotEmpty) {
       parts.add(_firstLine(notice.text));
     }
     if (parts.isEmpty) {
@@ -982,8 +1052,8 @@ class AppController extends ChangeNotifier {
             msgId: m.msgId,
           )
           .catchError((Object e) {
-        debugPrint('通知を出せませんでした: $e');
-      }),
+            debugPrint('通知を出せませんでした: $e');
+          }),
     );
   }
 
@@ -1090,8 +1160,8 @@ class AppController extends ChangeNotifier {
             msgId: pending.length == 1 ? newest.msgId : null,
           )
           .catchError((Object e) {
-        debugPrint('通知を出せませんでした: $e');
-      }),
+            debugPrint('通知を出せませんでした: $e');
+          }),
     );
   }
 
@@ -1122,15 +1192,17 @@ class AppController extends ChangeNotifier {
           continue;
         }
         _knownReportIds.add(m.msgId);
-        if (_store.isDisplayable(m, now) &&
-            !isTestEnvelope(m.envelope)) {
+        if (_store.isDisplayable(m, now) && !isTestEnvelope(m.envelope)) {
           freshReports.add(m);
         }
       } else {
         _knownReportIds.add(m.msgId);
         final target = m.envelope.supersedes;
         final t = target == null ? null : _store.get(target);
-        if (!m.isLocal && t != null && t.isLocal && t.kind == MessageKind.help) {
+        if (!m.isLocal &&
+            t != null &&
+            t.isLocal &&
+            t.kind == MessageKind.help) {
           freshAcks.add(m);
         }
       }
@@ -1148,18 +1220,20 @@ class AppController extends ChangeNotifier {
     for (final ack in freshAcks) {
       final report = _store.get(ack.envelope.supersedes!);
       final body = report?.envelope.help;
-      unawaited(platform
-          .showNotice(
-            id: ack.msgId & 0x7FFFFFFF,
-            title: '${ackSenderLabel(ack)}が 受け取りました',
-            body: body?.title ?? '送った 知らせが 届きました',
-            groupCode: ack.groupId,
-            importance: NoticeImportance.important,
-            msgId: report?.msgId,
-          )
-          .catchError((Object e) {
-        debugPrint('通知を出せませんでした: $e');
-      }));
+      unawaited(
+        platform
+            .showNotice(
+              id: ack.msgId & 0x7FFFFFFF,
+              title: '${ackSenderLabel(ack)}が 受け取りました',
+              body: body?.title ?? '送った 知らせが 届きました',
+              groupCode: ack.groupId,
+              importance: NoticeImportance.important,
+              msgId: report?.msgId,
+            )
+            .catchError((Object e) {
+              debugPrint('通知を出せませんでした: $e');
+            }),
+      );
     }
     final batched = <StoredMessage>[];
     for (final m in freshReports) {
@@ -1167,18 +1241,20 @@ class AppController extends ChangeNotifier {
       if (entry != null &&
           entry.info.type == ReportType.sos &&
           _urgentAllowed(m.groupId)) {
-        unawaited(platform
-            .showNotice(
-              id: m.msgId & 0x7FFFFFFF,
-              title: '住民から SOS が 届きました',
-              body: reportNotificationBody(entry),
-              groupCode: m.groupId,
-              importance: NoticeImportance.urgent,
-              msgId: m.msgId,
-            )
-            .catchError((Object e) {
-          debugPrint('通知を出せませんでした: $e');
-        }));
+        unawaited(
+          platform
+              .showNotice(
+                id: m.msgId & 0x7FFFFFFF,
+                title: '住民から SOS が 届きました',
+                body: reportNotificationBody(entry),
+                groupCode: m.groupId,
+                importance: NoticeImportance.urgent,
+                msgId: m.msgId,
+              )
+              .catchError((Object e) {
+                debugPrint('通知を出せませんでした: $e');
+              }),
+        );
       } else {
         batched.add(m);
       }
@@ -1249,21 +1325,23 @@ class AppController extends ChangeNotifier {
     } else {
       title = '住民からの 知らせが ${entries.length}件 届きました';
       body = ReportSummary.of(
-              entries.map((e) => (info: e.info, acked: e.acked)))
-          .line();
+        entries.map((e) => (info: e.info, acked: e.acked)),
+      ).line();
     }
-    unawaited(platform
-        .showNotice(
-          id: firstId & 0x7FFFFFFF,
-          title: title,
-          body: body,
-          groupCode: newest.groupId,
-          importance: NoticeImportance.important,
-          msgId: entries.length == 1 ? newest.msgId : null,
-        )
-        .catchError((Object e) {
-      debugPrint('通知を出せませんでした: $e');
-    }));
+    unawaited(
+      platform
+          .showNotice(
+            id: firstId & 0x7FFFFFFF,
+            title: title,
+            body: body,
+            groupCode: newest.groupId,
+            importance: NoticeImportance.important,
+            msgId: entries.length == 1 ? newest.msgId : null,
+          )
+          .catchError((Object e) {
+            debugPrint('通知を出せませんでした: $e');
+          }),
+    );
   }
 
   /// 参加グループの名前・ポリシー・拡張情報を、受け取った group_info から補完する。
@@ -1283,16 +1361,18 @@ class AppController extends ChangeNotifier {
       final digest = info.codeDigest;
       final digestHex = digest != null ? hexOf(digest) : null;
       if (info.generation >= g.generation) {
-        unawaited(_groups.updatePolicy(
-          g.code,
-          membersCanPost: info.membersCanPost,
-          acceptsHelp: info.acceptsHelp,
-          closed: info.closed,
-          successor: info.successor,
-          generation: info.generation,
-          codeDigestHex: digestHex,
-          description: info.description,
-        ));
+        unawaited(
+          _groups.updatePolicy(
+            g.code,
+            membersCanPost: info.membersCanPost,
+            acceptsHelp: info.acceptsHelp,
+            closed: info.closed,
+            successor: info.successor,
+            generation: info.generation,
+            codeDigestHex: digestHex,
+            description: info.description,
+          ),
+        );
         if (digestHex != null) {
           unawaited(_groups.reverifyStaff(g.code));
         }
@@ -1393,7 +1473,9 @@ class AppController extends ChangeNotifier {
     if (_settings.notificationLevel == NotificationLevel.off) {
       await platform.cancelMonthlyReminder();
     } else {
-      await platform.scheduleMonthlyReminder(at: nextReminderAt(dateTimeFromEpoch(_now())));
+      await platform.scheduleMonthlyReminder(
+        at: nextReminderAt(dateTimeFromEpoch(_now())),
+      );
     }
   }
 
@@ -1472,8 +1554,7 @@ class AppController extends ChangeNotifier {
     await platform.setKeepScreenOn(true);
     _keepScreenOnUntil = _now() + kKeepScreenOnDuration.inSeconds;
     _keepScreenTimer?.cancel();
-    _keepScreenTimer =
-        (_createTimer ?? Timer.new)(kKeepScreenOnDuration, () {
+    _keepScreenTimer = (_createTimer ?? Timer.new)(kKeepScreenOnDuration, () {
       unawaited(stopKeepScreenOn());
     });
     notifyListeners();
@@ -1585,7 +1666,8 @@ class AppController extends ChangeNotifier {
     if (cleanTitle.isEmpty) {
       throw ArgumentError.value(title, 'title', '見出しを入れてください');
     }
-    if (training && group.postRole != SenderRole.resident &&
+    if (training &&
+        group.postRole != SenderRole.resident &&
         !isTrainingTitle(cleanTitle)) {
       cleanTitle = '$kTrainingPrefix$cleanTitle';
     }
@@ -1704,7 +1786,8 @@ class AppController extends ChangeNotifier {
     }
     final createdAt = _now();
     final expiresAt = _clampEpoch(
-        _max(_store.localExpiresAt(target), createdAt) + kTombstoneGraceSeconds);
+      _max(_store.localExpiresAt(target), createdAt) + kTombstoneGraceSeconds,
+    );
     final tombstone = Envelope.create(
       kind: MessageKind.tombstone,
       groupId: target.groupId,
@@ -1727,11 +1810,12 @@ class AppController extends ChangeNotifier {
     final targets = _store
         .visibleNotices(now: _now(), groupIds: {groupCode})
         .where((m) {
-      final n = m.envelope.notice;
-      return n != null &&
-          isTrainingTitle(n.title) &&
-          (m.isLocal || official);
-    }).toList();
+          final n = m.envelope.notice;
+          return n != null &&
+              isTrainingTitle(n.title) &&
+              (m.isLocal || official);
+        })
+        .toList();
     for (final m in targets) {
       await retract(m.msgId);
     }
@@ -1749,7 +1833,8 @@ class AppController extends ChangeNotifier {
   }
 
   /// 知らせを見られるグループがあるか。
-  bool get seesAnyReports => _groups.groups.any((g) => g.canManage || g.isStaff);
+  bool get seesAnyReports =>
+      _groups.groups.any((g) => g.canManage || g.isStaff);
 
   /// ホームの「本部に 知らせる」から送れるグループ（「受け付ける」が オンで、
   /// 自分が本部・スタッフではないもの）。
@@ -1828,8 +1913,9 @@ class AppController extends ChangeNotifier {
       injured: type.allowsInjured && injured,
       inReplyTo: inReplyTo,
     );
-    final cleanName =
-        type.allowsName ? truncateUtf8(name.trim(), kMaxSenderNameBytes) : '';
+    final cleanName = type.allowsName
+        ? truncateUtf8(name.trim(), kMaxSenderNameBytes)
+        : '';
     final body = NoticeBody(
       senderName: cleanName,
       title: info.title(name: cleanName),
@@ -1851,45 +1937,84 @@ class AppController extends ChangeNotifier {
     return envelope;
   }
 
+  /// 中継キャッシュから消えても、本部の受信記録から詳細を開ける。
+  StoredMessage? reportMessage(int msgId) {
+    final record = _inbox.get(msgId);
+    if (record != null &&
+        record.retainUntil > _now() &&
+        canSeeReports(record.message.groupId)) {
+      return record.message;
+    }
+    return _store.get(msgId);
+  }
+
   /// 知らせ 1 件を画面用にまとめる。kind=help で読めなければ null。
   ReportEntry? reportEntryOf(StoredMessage m) {
     final body = m.envelope.help;
     if (body == null) {
       return null;
     }
+    final ack =
+        (canSeeReports(m.groupId) ? _inbox.get(m.msgId)?.ack : null) ??
+        _store.ackFor(m.msgId);
     return ReportEntry(
       message: m,
       body: body,
-      info: ReportInfo.decode(body.ext) ?? const ReportInfo(type: ReportType.need),
-      ack: _store.ackFor(m.msgId),
+      info:
+          ReportInfo.decode(body.ext) ??
+          const ReportInfo(type: ReportType.need),
+      ack: ack,
+      replyPending:
+          ack != null &&
+          ack.isLocal &&
+          !_store.contains(ack.msgId) &&
+          ack.envelope.expiresAt >= _now(),
+      expired: _store.localExpiresAt(m) < _now(),
     );
   }
 
   /// 本部・スタッフとして見られる知らせ（自分が送ったものは除く、新しい順）。
   /// [groupCode] でグループ、[inReplyTo] で安否確認への返事に絞る。
-  List<ReportEntry> receivedReports({int? groupCode, int? inReplyTo}) {
+  List<ReportEntry> receivedReports({
+    int? groupCode,
+    int? inReplyTo,
+    bool includeExpired = false,
+  }) {
     final ids = <int>{
       for (final g in _groups.groups)
-        if ((g.canManage || g.isStaff) && (groupCode == null || g.code == groupCode))
+        if ((g.canManage || g.isStaff) &&
+            (groupCode == null || g.code == groupCode))
           g.code,
     };
-    if (ids.isEmpty) {
-      return const [];
-    }
+    if (ids.isEmpty) return const [];
+    final now = _now();
+    // 昇格直後の移行中でも、既にディスクにある中継側の記録は読める。
+    final messages = <int, StoredMessage>{
+      for (final m in _store.all)
+        if (m.kind == MessageKind.help && ids.contains(m.groupId)) m.msgId: m,
+      for (final r in _inbox.all)
+        if (r.retainUntil > now && ids.contains(r.message.groupId))
+          r.msgId: r.message,
+    };
     final out = <ReportEntry>[];
-    for (final m in _store.visibleHelpRequests(now: _now(), groupIds: ids)) {
-      if (m.isLocal) {
-        continue;
-      }
+    for (final m in messages.values) {
+      if (m.isLocal || m.retracted || m.isStub) continue;
       final e = reportEntryOf(m);
-      if (e == null) {
-        continue;
-      }
-      if (inReplyTo != null && e.info.inReplyTo != inReplyTo) {
+      if (e == null ||
+          (!includeExpired && e.expired) ||
+          (inReplyTo != null && e.info.inReplyTo != inReplyTo)) {
         continue;
       }
       out.add(e);
     }
+    out.sort((a, b) {
+      final time = b.message.receivedAt.compareTo(a.message.receivedAt);
+      return time != 0
+          ? time
+          : b.message.envelope.createdAt.compareTo(
+              a.message.envelope.createdAt,
+            );
+    });
     return out;
   }
 
@@ -1908,7 +2033,9 @@ class AppController extends ChangeNotifier {
     final out = <ReportEntry>[];
     final now = _now();
     for (final m in _store.all) {
-      if (!m.isLocal || m.kind != MessageKind.help || !_store.isDisplayable(m, now)) {
+      if (!m.isLocal ||
+          m.kind != MessageKind.help ||
+          !_store.isDisplayable(m, now)) {
         continue;
       }
       final e = reportEntryOf(m);
@@ -1920,32 +2047,49 @@ class AppController extends ChangeNotifier {
       }
       out.add(e);
     }
-    out.sort((a, b) => b.message.envelope.createdAt.compareTo(a.message.envelope.createdAt));
+    out.sort(
+      (a, b) =>
+          b.message.envelope.createdAt.compareTo(a.message.envelope.createdAt),
+    );
     return out;
   }
 
   /// 本部・スタッフが知らせに「受け取りました」を返す（kind=ack）。
   /// すでに返していれば何もしない（null を返す）。
   Future<Envelope?> acknowledgeReport(int msgId) async {
-    final target = _store.get(msgId);
-    if (target == null || target.kind != MessageKind.help) {
+    final ack = _prepareReportAck(msgId);
+    if (ack == null) return null;
+    await node.publish(ack);
+    return ack;
+  }
+
+  Envelope? _prepareReportAck(int msgId) {
+    final target = reportMessage(msgId);
+    if (target == null || target.kind != MessageKind.help || target.retracted) {
       throw StateError('知らせが 見つかりません');
     }
     final group = _groups.byCode(target.groupId);
     if (group == null || !(group.canManage || group.isStaff)) {
       throw StateError('本部・スタッフの 端末だけが 返事を できます');
     }
-    if (_store.ackFor(msgId) != null) {
+    final existing = _inbox.get(msgId)?.ack ?? _store.ackFor(msgId);
+    if (existing != null) {
+      // inbox 保存後に中継ファイルだけ失敗した場合も、同じ返信を再試行する。
+      if (existing.isLocal &&
+          !_store.contains(existing.msgId) &&
+          existing.envelope.expiresAt >= _now()) {
+        return existing.envelope;
+      }
       return null;
     }
     final createdAt = _now();
-    var expiresAt = _max(_store.localExpiresAt(target), createdAt) +
-        kReportAckGrace.inSeconds;
-    final cap = createdAt + kReportAckMaxTtl.inSeconds;
-    if (expiresAt > cap) {
-      expiresAt = cap;
+    if (_store.localExpiresAt(target) < createdAt) {
+      throw StateError('この 知らせは 期限が 切れています。新しい 知らせを 確かめてください');
     }
-    final ack = Envelope.create(
+    var expiresAt = _store.localExpiresAt(target) + kReportAckGrace.inSeconds;
+    final cap = createdAt + kReportAckMaxTtl.inSeconds;
+    if (expiresAt > cap) expiresAt = cap;
+    return Envelope.create(
       kind: MessageKind.ack,
       groupId: target.groupId,
       originId: nodeId,
@@ -1956,20 +2100,28 @@ class AppController extends ChangeNotifier {
       supersedes: msgId,
       bodyPlain: Uint8List(0),
     );
-    await node.publish(ack);
-    return ack;
   }
 
-  /// まだ返事をしていない知らせに、まとめて「受け取りました」を返す。返した件数。
+  /// 100 件ずつ保存・通知をまとめ、受信や画面操作に処理を戻す。
   Future<int> acknowledgeAll(Iterable<ReportEntry> entries) async {
+    final ids = {
+      for (final e in entries)
+        if ((!e.acked || e.replyPending) && !e.expired) e.msgId,
+    }.toList();
     var n = 0;
-    for (final e in entries) {
-      if (e.acked) {
-        continue;
+    for (var start = 0; start < ids.length; start += 100) {
+      final end = start + 100 < ids.length ? start + 100 : ids.length;
+      final batch = <Envelope>[];
+      for (final id in ids.sublist(start, end)) {
+        final ack = _prepareReportAck(id);
+        if (ack != null) batch.add(ack);
       }
-      if (await acknowledgeReport(e.msgId) != null) {
-        n++;
+      if (batch.isNotEmpty) {
+        n += await _store.addAll(batch, now: _now(), isLocal: true);
+        _node?.nudge();
       }
+      // Widget テストの仮想タイマーを不要にしつつ I/O と通信を進める。
+      await Future<void>.value();
     }
     return n;
   }
@@ -1997,6 +2149,7 @@ class AppController extends ChangeNotifier {
         e.body.title,
         if (e.body.place.isNotEmpty) '場所: ${e.body.place}',
         if (e.body.text.trim().isNotEmpty) e.body.text.trim(),
+        if (e.expired) '期限切れの 過去の 記録',
         e.acked ? '受け取り済み' : 'まだ 返事を していない',
         '番号 ${bulletinNumber(e.msgId)}',
       ];
@@ -2056,10 +2209,14 @@ class AppController extends ChangeNotifier {
   /// code_digest と照合する。
   Future<ElevateResult> elevate(int code, String input) async {
     final info = _store.latestGroupInfo(code)?.envelope.groupInfo;
-    final result =
-        await _groups.elevate(code, input, knownDigest: info?.codeDigest);
+    final result = await _groups.elevate(
+      code,
+      input,
+      knownDigest: info?.codeDigest,
+    );
     if (result == ElevateResult.hq || result == ElevateResult.staff) {
       _store.officialGroupIds = _groups.officialCodes;
+      await _backfillInbox();
       notifyListeners();
     }
     return result;
@@ -2130,8 +2287,9 @@ class AppController extends ChangeNotifier {
     final body = GroupInfoBody(
       name: _truncateUtf8(group.name, kMaxGroupNameBytes),
       hostName: _truncateUtf8(
-          group.isHost ? (group.hostName ?? _displayName) : group.name,
-          kMaxHostNameBytes),
+        group.isHost ? (group.hostName ?? _displayName) : group.name,
+        kMaxHostNameBytes,
+      ),
       membersCanPost: group.membersCanPost,
       description: _truncateUtf8(group.description, kMaxDescriptionBytes),
       closed: group.closed,
@@ -2167,7 +2325,10 @@ class AppController extends ChangeNotifier {
   List<StoredMessage> notices({int? groupCode, bool byReceived = true}) {
     final ids = groupCode != null ? {groupCode} : _groups.codes;
     return _store.visibleNotices(
-        now: _now(), groupIds: ids, byReceived: byReceived);
+      now: _now(),
+      groupIds: ids,
+      byReceived: byReceived,
+    );
   }
 
   /// いま出ている公式の避難情報・注意喚起（固定枠用、新しい順に最大 3 件、C03）。
@@ -2190,18 +2351,18 @@ class AppController extends ChangeNotifier {
 
   /// 訓練投稿の未読件数（C23）。
   int get unreadTrainingCount => notices().where((m) {
-        final n = m.envelope.notice;
-        return !m.read && n != null && isTrainingTitle(n.title);
-      }).length;
+    if (m.read) return false;
+    final n = m.envelope.notice;
+    return n != null && isTrainingTitle(n.title);
+  }).length;
 
   Future<void> markRead(int msgId) => _store.markRead(msgId);
 
   /// 一覧に表示した未読をすべて既読にする（C03）。
   Future<void> markVisibleRead({int? groupCode}) async {
-    final ids = notices(groupCode: groupCode)
-        .where((m) => !m.read)
-        .map((m) => m.msgId)
-        .toSet();
+    final ids = notices(
+      groupCode: groupCode,
+    ).where((m) => !m.read).map((m) => m.msgId).toSet();
     if (ids.isNotEmpty) {
       await _store.markAllRead(ids);
     }
@@ -2237,14 +2398,16 @@ class AppController extends ChangeNotifier {
     TestBody body = TestBody.plain,
   }) {
     final now = _now();
-    return _addTestData(makeTestNotices(
-      count: count,
-      groupId: groupCode,
-      now: now,
-      random: Random(),
-      body: body,
-      startIndex: testDataCount + 1,
-    ));
+    return _addTestData(
+      makeTestNotices(
+        count: count,
+        groupId: groupCode,
+        now: now,
+        random: Random(),
+        body: body,
+        startIndex: testDataCount + 1,
+      ),
+    );
   }
 
   /// 保存の上限（3,000 件）まで、ばらばらの文字のお知らせで埋める（TD4）。
@@ -2254,7 +2417,10 @@ class AppController extends ChangeNotifier {
       return Future<int>.value(0);
     }
     return addTestNotices(
-        groupCode: groupCode, count: room, body: TestBody.noise);
+      groupCode: groupCode,
+      count: room,
+      body: TestBody.noise,
+    );
   }
 
   /// テスト用の住民からの知らせを [count] 件入れる（TD5 の「無事です 100 件」など）。
@@ -2263,13 +2429,15 @@ class AppController extends ChangeNotifier {
     required int count,
     ReportType type = ReportType.safe,
   }) {
-    return _addTestData(makeTestReports(
-      count: count,
-      groupId: groupCode,
-      now: _now(),
-      random: Random(),
-      type: type,
-    ));
+    return _addTestData(
+      makeTestReports(
+        count: count,
+        groupId: groupCode,
+        now: _now(),
+        random: Random(),
+        type: type,
+      ),
+    );
   }
 
   Future<int> _addTestData(List<Envelope> envelopes) async {
@@ -2280,8 +2448,10 @@ class AppController extends ChangeNotifier {
   }
 
   /// テスト用データをこの端末から消す（ほかの端末には残る）。消した件数を返す。
-  Future<int> removeTestData() =>
-      _store.removeWhere((m) => isTestEnvelope(m.envelope));
+  Future<int> removeTestData() async {
+    await _inbox.removeWhere((r) => isTestEnvelope(r.message.envelope));
+    return _store.removeWhere((m) => isTestEnvelope(m.envelope));
+  }
 
   // ---------------------------------------------------------------------------
   // 補助

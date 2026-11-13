@@ -18,6 +18,7 @@ import '../core/frames.dart';
 import '../core/inventory_filter.dart';
 import '../core/ids.dart';
 import 'message_store.dart';
+import 'receive_budget.dart';
 
 /// HELLO 待ちの既定タイムアウト。
 const Duration kHelloTimeout = Duration(seconds: 5);
@@ -46,8 +47,14 @@ const int kRelaySmallChunkThreshold = 180;
 /// 1 セッションで送る不透明メッセージのバイト上限（C13）。
 const int kMaxOpaqueBytesPerSession = 16 * 1024;
 
+const int kMaxPendingReceiveMessages = 2048;
+const int kMaxPendingReceiveBytes = 4 * 1024 * 1024;
+const int kStoreBatchSize = 128;
+const int kMaxSessionControlBytes = 64 * 1024;
+
 /// タイマー生成関数の型（テストでは仮想時計に差し替える）。
-typedef TimerFactory = Timer Function(Duration duration, void Function() callback);
+typedef TimerFactory =
+    Timer Function(Duration duration, void Function() callback);
 
 Timer _realTimer(Duration duration, void Function() callback) =>
     Timer(duration, callback);
@@ -96,7 +103,9 @@ class SyncSession {
     this.onPeerTime,
     this.cannotReachPeer,
     this.knownPeerIds,
+    ReceiveBudget? receiveBudget,
   }) : maxChunk = maxChunk < 1 ? 1 : maxChunk,
+       _receiveBudget = receiveBudget ?? ReceiveBudget(),
        _createTimer = createTimer ?? _realTimer,
        _byteBudget = _budgetFor(sessionByteBudget, maxChunk);
 
@@ -152,6 +161,16 @@ class SyncSession {
   final Duration _helloTimeout;
   Duration _sessionTimeout;
   int _byteBudget;
+  final ReceiveBudget _receiveBudget;
+  int _pendingReceiveMessages = 0;
+  int _pendingReceiveBytes = 0;
+  int _messageBytesReceived = 0;
+  int _controlBytesReceived = 0;
+  int _inventoryIdsReceived = 0;
+  bool _sentStoreConfirmation = false;
+  bool _peerStoreConfirmation = false;
+  final Set<int> _confirmedSentIds = <int>{};
+  bool _finishingInitiator = false;
 
   final FrameParser _parser = FrameParser();
   final Set<int> _peerHas = <int>{};
@@ -216,10 +235,19 @@ class SyncSession {
 
   /// 保存待ちの受信封筒。書き込み中に届いた分はまとめて 1 回で保存する
   /// （1 件ずつ fsync すると 300 件で 50 秒かかった、#152 の実測）。
-  final List<Envelope> _pendingStores = <Envelope>[];
+  final Queue<({Envelope envelope, int bytes})> _pendingStores = Queue();
   bool _storing = false;
 
   SessionState get state => _state;
+
+  /// 保存確認を使うのは両方の HELLO で対応が分かったときだけ。
+  bool get confirmsStorage => (caps & peerCaps & kCapStoreConfirmation) != 0;
+  bool get peerStorageConfirmed => confirmsStorage && _peerStoreConfirmation;
+  List<int> get confirmedSentMessageIds => List.unmodifiable(_confirmedSentIds);
+  int get pendingReceiveMessages => _pendingReceiveMessages;
+  int get pendingReceiveBytes => _pendingReceiveBytes;
+  bool get _storageReady =>
+      !confirmsStorage || (_sentStoreConfirmation && _peerStoreConfirmation);
 
   /// 相手のノード ID（HELLO 受信後）。
   Uint8List? get peerNodeId => _peerHello?.nodeId;
@@ -269,7 +297,7 @@ class SyncSession {
   /// このセッションの後に相手が持っているはずの msg_id（相手の目録 ∪ 渡したもの
   /// ∪ 受け取ったもの）。次に同期し直す必要があるかの判定に使う。
   Set<int> get knownByPeer {
-    final known = <int>{..._peerHas, ..._sentIds, ..._receivedIds};
+    final known = <int>{..._peerHas, ..._confirmedSentIds, ..._receivedIds};
     final filter = _peerFilter;
     if (filter != null) {
       for (final m in _store.all) {
@@ -284,7 +312,7 @@ class SyncSession {
   /// 途中で切れたセッションでも確かな「相手が持っているもの」（相手の目録 ∪
   /// 相手から受け取ったもの。渡したものは届いたか分からないので含めない）。
   Set<int> get knownByPeerConfirmed {
-    final known = <int>{..._peerHas, ..._receivedIds};
+    final known = <int>{..._peerHas, ..._confirmedSentIds, ..._receivedIds};
     final filter = _peerFilter;
     if (filter != null) {
       for (final m in _store.all) {
@@ -348,8 +376,8 @@ class SyncSession {
   void _armSessionTimer() {
     _sessionTimer?.cancel();
     _sessionTimer = _createTimer(_sessionTimeout, () {
-      if (_state == SessionState.closing) {
-        // 転送は済んでいる。BYE / 切断が来ないだけなので正常終了として閉じる。
+      if (_state == SessionState.closing && _storageReady) {
+        // 双方の保存確認後（旧版は旧手順）、BYE が来ない場合の後片付け。
         unawaited(_finishAfterStores(success: true));
       } else {
         _fail('セッションタイムアウト');
@@ -360,12 +388,14 @@ class SyncSession {
   Future<void> _run() async {
     try {
       final now = _now();
-      await _enqueueSend(Frame.hello(
-        nodeId: _nodeId,
-        storeCount: _store.count,
-        caps: caps,
-        groupIds: isRelay ? groupIds : const [],
-      ).encode());
+      await _enqueueSend(
+        Frame.hello(
+          nodeId: _nodeId,
+          storeCount: _store.count,
+          caps: caps,
+          groupIds: isRelay ? groupIds : const [],
+        ).encode(),
+      );
       await _enqueueSend(Frame.time(now).encode());
       if (!_startCompleter.isCompleted) {
         _startCompleter.complete();
@@ -389,7 +419,9 @@ class SyncSession {
         _logLine('在庫 ${ids.length} 件を要約で送信（${filter.bits.length} B）');
       } else {
         final selection = _store.inventorySelection(
-            now: _now(), small: maxChunk < kSmallChunkThreshold);
+          now: _now(),
+          small: maxChunk < kSmallChunkThreshold,
+        );
         for (final frame in Frame.inventoryFrames(selection.msgIds)) {
           await _enqueueSend(frame.encode());
         }
@@ -398,8 +430,10 @@ class SyncSession {
           await _enqueueSend(Frame.inventoryCutoff(cutoff).encode());
         }
         await _enqueueSend(Frame.inventoryEnd().encode());
-        _logLine('在庫 ${selection.msgIds.length} 件を送信'
-            '${cutoff != null ? '（絞り込み）' : ''}');
+        _logLine(
+          '在庫 ${selection.msgIds.length} 件を送信'
+          '${cutoff != null ? '（絞り込み）' : ''}',
+        );
       }
 
       await _peerInventoryEnd.future;
@@ -439,8 +473,10 @@ class SyncSession {
         Frame.messagesEnd(more: _budgetExhausted, pollMe: pollMe).encode(),
       );
       _sentMessagesEnd = true;
-      _logLine('MESSAGE $_messagesSent 件を送信'
-          '${_pushed.isNotEmpty ? '（先出し ${_pushed.length} 件）' : ''}');
+      _logLine(
+        'MESSAGE $_messagesSent 件を送信'
+        '${_pushed.isNotEmpty ? '（先出し ${_pushed.length} 件）' : ''}',
+      );
       _checkBothDone();
     } on Object catch (e) {
       _fail('送信エラー: $e');
@@ -449,7 +485,10 @@ class SyncSession {
 
   /// 1 件の MESSAGE を上限内で送信待ちに積む。
   _SendOutcome _sendMessage(StoredMessage m) {
-    final wire = m.wireBytesAt(_now(), localExpiresAt: _store.localExpiresAt(m));
+    final wire = m.wireBytesAt(
+      _now(),
+      localExpiresAt: _store.localExpiresAt(m),
+    );
     final bytes = Frame.message(wire).encode();
     if (_messageBytesSent + bytes.length > _byteBudget) {
       return _SendOutcome.budget;
@@ -471,15 +510,19 @@ class SyncSession {
   Future<void> _sendPush() async {
     final peerNode = peerNodeId;
     final known = peerNode == null ? null : knownPeerIds?.call(peerNode);
-    final candidates =
-        _store.pushCandidates(now: _now(), skip: known ?? const <int>{});
+    final candidates = _store.pushCandidates(
+      now: _now(),
+      skip: known ?? const <int>{},
+    );
     var bytes = 0;
     for (final m in candidates) {
       if (isFinished || _sentMessagesEnd) {
         return;
       }
-      final wire =
-          m.wireBytesAt(_now(), localExpiresAt: _store.localExpiresAt(m));
+      final wire = m.wireBytesAt(
+        _now(),
+        localExpiresAt: _store.localExpiresAt(m),
+      );
       final frame = Frame.message(wire).encode();
       if (bytes + frame.length > kPushMaxBytes) {
         break;
@@ -568,7 +611,9 @@ class SyncSession {
           final rest = head.bytes.length - _outOffset;
           final room = maxChunk - b.length;
           final take = rest < room ? rest : room;
-          b.add(Uint8List.sublistView(head.bytes, _outOffset, _outOffset + take));
+          b.add(
+            Uint8List.sublistView(head.bytes, _outOffset, _outOffset + take),
+          );
           _outOffset += take;
           if (_outOffset == head.bytes.length) {
             _out.removeFirst();
@@ -617,6 +662,13 @@ class SyncSession {
       return;
     }
     _bytesReceived += chunk.length;
+    final receiveLimit = relaxed
+        ? kRelaySessionByteBudget
+        : kDefaultSessionByteBudget;
+    if (_bytesReceived > receiveLimit + kMaxSessionControlBytes) {
+      _fail('受信総量の上限を超えました');
+      return;
+    }
     try {
       _parser.addChunk(chunk);
     } on FrameFormatException catch (e) {
@@ -631,6 +683,13 @@ class SyncSession {
 
   void _handleFrame(Frame frame) {
     final type = frame.type;
+    if (type != FrameType.message) {
+      _controlBytesReceived += 3 + frame.payload.length;
+      if (_controlBytesReceived > kMaxSessionControlBytes) {
+        _fail('制御データの受信上限を超えました');
+        return;
+      }
+    }
     if (type == null) {
       // 不明な type は読み飛ばす。
       return;
@@ -658,6 +717,8 @@ class SyncSession {
         _peerHasMore = Frame.messagesEndHasMore(frame.payload);
         _peerWantsPoll = initiator && Frame.messagesEndPollMe(frame.payload);
         _onMessagesEnd();
+      case FrameType.stored:
+        _onStored(frame);
       case FrameType.bye:
         _onBye();
     }
@@ -679,9 +740,11 @@ class SyncSession {
     _helloTimer?.cancel();
     _helloTimer = null;
     _state = SessionState.inventory;
-    _logLine('HELLO 受信 node=${hexOf(hello.nodeId)} 件数=${hello.storeCount}'
-        '${hello.version != kProtocolVersionForHello ? ' version=${hello.version}' : ''}'
-        '${hello.isRelayNode ? ' 中継役' : ''}');
+    _logLine(
+      'HELLO 受信 node=${hexOf(hello.nodeId)} 件数=${hello.storeCount}'
+      '${hello.version != kProtocolVersionForHello ? ' version=${hello.version}' : ''}'
+      '${hello.isRelayNode ? ' 中継役' : ''}',
+    );
     if (isRelay && hello.isRelayNode) {
       _relaxed = true;
       _byteBudget = maxChunk < kRelaySmallChunkThreshold
@@ -719,7 +782,14 @@ class SyncSession {
       return;
     }
     try {
-      _peerHas.addAll(parseInventory(frame.payload));
+      final ids = parseInventory(frame.payload);
+      _inventoryIdsReceived += ids.length;
+      if (_inventoryIdsReceived > kDefaultInventoryLimit ||
+          _peerFilter != null) {
+        _fail('目録の受信上限または形式が不正');
+        return;
+      }
+      _peerHas.addAll(ids);
     } on FrameFormatException catch (e) {
       _fail('不正な INVENTORY: ${e.message}');
     }
@@ -731,7 +801,14 @@ class SyncSession {
       return;
     }
     try {
-      _peerFilter = InventoryFilter.decode(frame.payload);
+      final filter = InventoryFilter.decode(frame.payload);
+      if (_peerFilter != null ||
+          _inventoryIdsReceived != 0 ||
+          filter.itemCount > kDefaultInventoryLimit) {
+        _fail('目録の受信上限または形式が不正');
+        return;
+      }
+      _peerFilter = filter;
     } on FormatException catch (e) {
       _fail('不正な INVENTORY_FILTER: ${e.message}');
     }
@@ -755,9 +832,11 @@ class SyncSession {
     }
     _state = SessionState.transfer;
     final filter = _peerFilter;
-    _logLine(filter != null
-        ? '相手の在庫 ${filter.itemCount} 件（要約 ${filter.bits.length} B）'
-        : '相手の在庫 ${_peerHas.length} 件');
+    _logLine(
+      filter != null
+          ? '相手の在庫 ${filter.itemCount} 件（要約 ${filter.bits.length} B）'
+          : '相手の在庫 ${_peerHas.length} 件',
+    );
     if (!_peerInventoryEnd.isCompleted) {
       _peerInventoryEnd.complete();
     }
@@ -771,6 +850,14 @@ class SyncSession {
     }
     if (_peerMessagesEnd) {
       _fail('MESSAGES_END の後に MESSAGE を受信');
+      return;
+    }
+    _messageBytesReceived += 3 + frame.payload.length;
+    final receiveLimit = relaxed
+        ? kRelaySessionByteBudget
+        : kDefaultSessionByteBudget;
+    if (_messageBytesReceived > receiveLimit) {
+      _fail('MESSAGE の受信上限を超えました');
       return;
     }
     final Envelope envelope;
@@ -787,7 +874,19 @@ class SyncSession {
         ? kMaxHopValue
         : envelope.hop + 1;
     final relayed = envelope.copyWith(hop: nextHop);
-    _pendingStores.add(relayed);
+    final bytes =
+        frame.payload.length +
+        (envelope.isOpaque ? 0 : envelope.bodyPlain.length) +
+        128;
+    if (_pendingReceiveMessages >= kMaxPendingReceiveMessages ||
+        _pendingReceiveBytes + bytes > kMaxPendingReceiveBytes ||
+        !_receiveBudget.reserve(bytes)) {
+      _fail('保存待ちの受信上限に達しました。次の交換で再試行します');
+      return;
+    }
+    _pendingReceiveMessages++;
+    _pendingReceiveBytes += bytes;
+    _pendingStores.add((envelope: relayed, bytes: bytes));
     if (!_storing) {
       _storing = true;
       _storeQueue = _drainStores();
@@ -796,18 +895,40 @@ class SyncSession {
 
   Future<void> _drainStores() async {
     try {
-      while (_pendingStores.isNotEmpty) {
-        final batch = List<Envelope>.of(_pendingStores);
-        _pendingStores.clear();
+      while (_pendingStores.isNotEmpty && !isFinished) {
+        final batch = <Envelope>[];
+        var bytes = 0;
+        while (_pendingStores.isNotEmpty && batch.length < kStoreBatchSize) {
+          final pending = _pendingStores.removeFirst();
+          batch.add(pending.envelope);
+          bytes += pending.bytes;
+        }
         try {
           _messagesReceived += await _store.addAll(batch, now: _now());
         } on Object catch (e) {
-          _logLine('保存に失敗: $e');
+          _fail('保存に失敗: $e');
+        } finally {
+          _releaseReceived(batch.length, bytes);
         }
       }
     } finally {
       _storing = false;
     }
+  }
+
+  void _releaseReceived(int count, int bytes) {
+    _pendingReceiveMessages -= count;
+    _pendingReceiveBytes -= bytes;
+    _receiveBudget.release(count, bytes);
+  }
+
+  void _discardPendingStores() {
+    var bytes = 0;
+    for (final pending in _pendingStores) {
+      bytes += pending.bytes;
+    }
+    _releaseReceived(_pendingStores.length, bytes);
+    _pendingStores.clear();
   }
 
   /// 受け取った封筒をすべて保存し終えるまで待つ。
@@ -830,24 +951,97 @@ class SyncSession {
     _checkBothDone();
   }
 
-  void _onBye() {
-    if (_state == SessionState.closing) {
-      unawaited(_finishAfterStores(success: true));
-    } else {
-      _fail('相手から BYE を受信');
+  void _onStored(Frame frame) {
+    // 旧版には送らない。余分な確認や、送っていない ID の確認は受理しない。
+    if (!confirmsStorage ||
+        !_peerMessagesEnd ||
+        _peerStoreConfirmation ||
+        frame.payload.length < 3 ||
+        (frame.payload[0] & ~1) != 0) {
+      _fail('STORED の順序または形式が不正');
+      return;
+    }
+    try {
+      final ids = parseInventory(Uint8List.sublistView(frame.payload, 1));
+      final sent = _sentIds.toSet();
+      if (ids.any((id) => !sent.contains(id)) ||
+          _confirmedSentIds.length + ids.length > _sentIds.length) {
+        _fail('送っていない ID の保存確認');
+        return;
+      }
+      final last = (frame.payload[0] & 1) != 0;
+      if (last && ids.isNotEmpty) {
+        _fail('STORED 最終フレームには ID を載せられません');
+        return;
+      }
+      _confirmedSentIds.addAll(ids);
+      if (last) {
+        _peerStoreConfirmation = true;
+        _maybeFinishInitiator();
+      }
+    } on FrameFormatException catch (e) {
+      _fail('不正な STORED: ${e.message}');
     }
   }
 
-  /// 双方の MESSAGES_END が済んだら closing へ。initiator は BYE を送って閉じる。
+  void _onBye() {
+    if (_state == SessionState.closing && _storageReady) {
+      unawaited(_finishAfterStores(success: true));
+    } else {
+      _fail('保存確認前に相手から BYE を受信');
+    }
+  }
+
+  /// 双方の送信完了後に保存を待ち、対応端末間では保存確認を交換する。
   void _checkBothDone() {
     if (isFinished || _state == SessionState.closing) {
       return;
     }
     if (_sentMessagesEnd && _peerMessagesEnd) {
       _state = SessionState.closing;
-      if (initiator) {
-        unawaited(_finishAsInitiator());
+      unawaited(_confirmStored());
+    }
+  }
+
+  Future<void> _confirmStored() async {
+    await _waitStores();
+    if (isFinished) {
+      return;
+    }
+    if (confirmsStorage) {
+      try {
+        final ids = _receivedIds.where(_store.isDurablyStored).toList();
+        for (
+          var offset = 0;
+          offset < ids.length;
+          offset += kMaxInventoryPerFrame
+        ) {
+          final end = offset + kMaxInventoryPerFrame;
+          await _enqueueSend(
+            Frame.stored(
+              ids.sublist(offset, end < ids.length ? end : ids.length),
+            ).encode(),
+          );
+        }
+        // 相手が最終フレームに即応して BYE を返しても、保存済みと判定できる。
+        _sentStoreConfirmation = true;
+        await _enqueueSend(Frame.stored(const [], last: true).encode());
+      } on Object catch (e) {
+        _fail('保存確認の送信に失敗: $e');
+        return;
       }
+    }
+    _maybeFinishInitiator();
+  }
+
+  void _maybeFinishInitiator() {
+    if (!isFinished &&
+        _state == SessionState.closing &&
+        initiator &&
+        _storageReady &&
+        !_finishingInitiator) {
+      _finishingInitiator = true;
+      unawaited(_finishAsInitiator());
     }
   }
 
@@ -871,8 +1065,10 @@ class SyncSession {
       return;
     }
     await _requestClose();
-    _finish(success ? SessionState.done : SessionState.failed,
-        success ? null : '切断');
+    _finish(
+      success ? SessionState.done : SessionState.failed,
+      success ? null : '切断',
+    );
   }
 
   /// リンクが閉じられた。
@@ -880,7 +1076,7 @@ class SyncSession {
     if (isFinished) {
       return;
     }
-    if (_state == SessionState.closing) {
+    if (_state == SessionState.closing && _storageReady) {
       _closeRequested = true;
       unawaited(_finishAfterStores(success: true));
     } else {
@@ -904,6 +1100,7 @@ class SyncSession {
     _failureReason = reason;
     _logLine('失敗: $reason');
     _state = SessionState.failed;
+    _discardPendingStores();
     unawaited(_shutdown(sendBye: sendBye));
   }
 
@@ -950,8 +1147,10 @@ class SyncSession {
     }
     if (!_doneCompleter.isCompleted) {
       if (finalState == SessionState.done) {
-        _logLine('完了 送信 $_messagesSent 件 / 受信 $_messagesReceived 件 '
-            '($_bytesSent B ↑ / $_bytesReceived B ↓)');
+        _logLine(
+          '完了 送信 $_messagesSent 件 / 受信 $_messagesReceived 件 '
+          '($_bytesSent B ↑ / $_bytesReceived B ↓)',
+        );
       }
       _doneCompleter.complete();
     }

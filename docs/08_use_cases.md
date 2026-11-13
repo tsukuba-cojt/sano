@@ -362,7 +362,9 @@
 | HELLO caps bit1 | 1 | 中継役（設定「中継役として 使う」オン） | C04 C17 |
 | HELLO caps bit2 | 1 | HELLO 末尾に参加グループ一覧あり（中継役だけが立てる） | C17 |
 | HELLO caps bit3 | 1 | HELLO 直後の先出し（PUSH）を受けられる | C08 |
-| HELLO caps bit4〜7 | 0 | 予約 | — |
+| HELLO caps bit4 | 1 | 目録の要約（INVENTORY_FILTER） | v2.3 |
+| HELLO caps bit5 | 1 | 保存確認 STORED（docs/11） | v2.4 |
+| HELLO caps bit6〜7 | 0 | 予約 | — |
 | HELLO version | 1 | 当面 1 のまま送る。不一致でも切らず min(version) で続ける | C13 |
 | 封筒 flags bit0 / bit1 | — | 圧縮 / supersedes あり（現行） | — |
 | 封筒 flags bit2〜7 | 0 | 予約（訓練は見出し【訓練】、定型見出しは body の 5 番目フィールドで表すため flags は使わない） | C23 C25 |

@@ -2,6 +2,8 @@
 
 v2 は [08_use_cases.md](08_use_cases.md) の仕様変更 C01〜C25 を実装に合わせて反映した版。変更・追加した行の末尾に「（v2: C13）」のように変更 id を付ける。ワイヤ・同期・保存の規則は [02_protocol.md](02_protocol.md)、Dart の公開 API は [05_dart_api.md](05_dart_api.md)。（v2: C13）
 
+大量受信時の保存確定・本部記録・受信待ちの設計は [11_bulk_data_reliability.md](11_bulk_data_reliability.md) を参照（v2.4）。
+
 ## 1. スタック
 
 | 層 | 技術 | 理由 |
@@ -9,7 +11,7 @@ v2 は [08_use_cases.md](08_use_cases.md) の仕様変更 C01〜C25 を実装に
 | UI | Flutter (Dart) | 1 つの UI 実装で iOS/Android 共通。シミュレータ/エミュレータで画面検証できる |
 | プロトコル・保存・同期 | Dart（`lib/core`, `lib/mesh`） | 単一実装。フェイクトランスポートで多ノード模擬テストが可能 |
 | BLE トランスポート | Swift (CoreBluetooth) / Kotlin (android.bluetooth) | バックグラウンド規則は OS ごとに異なり、プラグインに依存しない |
-| 永続化 | 独自の追記型バイナリログ + `shared_preferences` | 依存最小。SQLite 不要の規模 |
+| 永続化 | 中継用 `messages.bin`、本部記録 `reports.bin` の追記型ログ（削除を伴う追加・本文消去では全置換）+ `shared_preferences` | 本部記録を中継キャッシュから分離し、各保存枠と受信待ちに上限を設ける |
 
 調査では「フルネイティブ」が最軽量と出たが、ソロ開発で両 OS の UI と同期ロジックを二重実装するリスクを避け、**UI と同期ロジックを Dart に一本化し BLE だけネイティブ**にする。バイナリは数 MB 増えるが、画面・ロジックの検証可能性を優先した。
 
@@ -32,6 +34,8 @@ lib/
   mesh/
     transport.dart          Transport インターフェースと TransportEvent
     message_store.dart      保存・検索・優先度・削除・相対期限・不透明メッセージ・空殻・先出し候補（永続化は store_file.dart）（v2: C12, C13, C20, C08）
+    report_inbox.dart       本部・スタッフの受信記録（報告＋最新返信、30 日、容量上限）（v2.4）
+    receive_budget.dart     複数接続で共有する保存待ちの件数・バイト上限（v2.4）
     store_file.dart         追記型ログの読み書き
     sync_session.dart       1 リンクの同期状態機械（先出し・TIME・中継役どうしの緩和）（v2: C08, C12, C17）
     mesh_node.dart          発見→接続判断→セッション生成、バックオフ、再接続、中継役モード、時計差の中央値（v2: C04, C12）
@@ -67,7 +71,7 @@ MethodChannel: `jp.kairanban/ble`、EventChannel: `jp.kairanban/ble/events`。
 
 | method | 引数 | 戻り値 | 説明 |
 |---|---|---|---|
-| `getState` | なし | `{supported: bool, poweredOn: bool, permission: "granted"|"denied"|"unknown", running: bool}` | 現在状態 |
+| `getState` | なし | `{supported: bool, poweredOn: bool, permission: "granted"\|"denied"\|"unknown", running: bool}` | 現在状態 |
 | `requestPermissions` | なし | `bool` | Bluetooth 権限を要求（Android 12+: SCAN/ADVERTISE/CONNECT、Android 11 以下: FINE_LOCATION、iOS: CoreBluetooth 初期化で自動） |
 | `start` | `{serviceUuid, rxUuid, txUuid: String, nodeId: Uint8List(8), lowPower: bool}` | なし | 広告 + GATT サーバ + スキャンを開始。Android は MeshService を前景起動 |
 | `stop` | なし | なし | すべて停止（Android は MeshService 停止） |

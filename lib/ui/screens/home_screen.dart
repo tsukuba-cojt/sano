@@ -193,6 +193,7 @@ class _HomeScreenState extends State<HomeScreen> {
         builder: (context, _) {
           final node = _c.node;
           final settings = _c.settings;
+          final storageError = _c.storageError;
           final groups = _c.groups.groups;
           final nowTime = dateTimeFromEpoch(_c.now);
           final lastSync = _lastSyncAt();
@@ -240,6 +241,7 @@ class _HomeScreenState extends State<HomeScreen> {
             return Column(
               children: [
                 statusBar,
+                if (storageError != null) _StorageErrorBand(storageError),
                 Expanded(
                   child: Center(
                     child: Padding(
@@ -296,6 +298,7 @@ class _HomeScreenState extends State<HomeScreen> {
           return Column(
             children: [
               statusBar,
+              if (storageError != null) _StorageErrorBand(storageError),
               if (!settings.relayMode && urgentIds.isNotEmpty)
                 _UrgentBand(
                   count: urgentIds.length,
@@ -533,6 +536,23 @@ String firstLineOf(String text, {int max = 30}) {
   return '${String.fromCharCodes(line.runes.take(max))}…';
 }
 
+/// 受信の保存失敗を、通信の状態だけでなくホームでも知らせる。
+class _StorageErrorBand extends StatelessWidget {
+  const _StorageErrorBand(this.message);
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.all(KairanSizes.pagePadding),
+        child: InfoBox(
+          message,
+          title: '保存できていない 情報があります',
+          kind: InfoKind.danger,
+        ),
+      );
+}
+
 /// 固定枠・日付見出し付きのお知らせ一覧。
 class _NoticeList extends StatelessWidget {
   const _NoticeList({
@@ -554,61 +574,20 @@ class _NoticeList extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final nowTime = dateTimeFromEpoch(now);
-    final items = <Widget>[];
-    if (pinned.isNotEmpty) {
-      items.add(_PinnedBox(controller: controller, alerts: pinned, onTap: onTap));
-    }
+    // 日付の区切りとメッセージへの参照だけを先に作る。
+    // 本文の読み取り・カード生成は、表示・先読み範囲の行だけに行う。
+    final rows = <({String? header, StoredMessage? message})>[];
     String? lastHeader;
-    for (final m in notices) {
-      final env = m.envelope;
-      final body = env.notice;
-      final created = dateTimeFromEpoch(env.createdAt);
-      final received = dateTimeFromEpoch(m.receivedAt);
+    for (final message in notices) {
+      final received = dateTimeFromEpoch(message.receivedAt);
       final header = receivedHeaderJa(received, now: nowTime);
       if (header != lastHeader) {
-        items.add(_DateHeader(header));
+        rows.add((header: header, message: null));
         lastHeader = header;
       }
-      final title = body?.title ?? '';
-      final training = isTrainingTitle(title);
-      final ended = env.supersedes != null && looksLikeEndTitle(title);
-      final localExpiry = controller.store.localExpiresAt(m);
-      final clockSuspicious = !m.isLocal &&
-          (env.createdAt > m.receivedAt + 3600 ||
-              env.createdAt < m.receivedAt - 24 * 3600);
-      items.add(
-        Padding(
-          padding: const EdgeInsets.only(bottom: KairanSizes.gap),
-          child: NoticeCard(
-            category: env.category,
-            role: env.role,
-            title: title,
-            place: body?.place ?? '',
-            textPreview: firstLineOf(body?.text ?? ''),
-            senderName: body?.senderName ?? '',
-            createdAt: created,
-            isNew: !m.read,
-            retracted: m.retracted,
-            retractedByOfficial: m.retractedByOfficial,
-            superseded: m.supersededBy != null,
-            isLocal: m.isLocal,
-            rewrite: env.supersedes != null && !ended,
-            ended: ended,
-            training: training,
-            alert: env.role == SenderRole.official &&
-                env.category.importance == NoticeImportance.urgent &&
-                !training,
-            endsAt: env.category.showsEndTime && !ended
-                ? dateTimeFromEpoch(env.expiresAt)
-                : null,
-            endingSoon: !ended && localExpiry - now <= 3600,
-            clockSuspicious: clockSuspicious,
-            asksReply: AppController.asksReply(m),
-            onTap: () => onTap(m.msgId),
-          ),
-        ),
-      );
+      rows.add((header: null, message: message));
     }
+    final pinnedRows = pinned.isEmpty ? 0 : 1;
     return ListView.builder(
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.fromLTRB(
@@ -617,8 +596,90 @@ class _NoticeList extends StatelessWidget {
         KairanSizes.pagePadding,
         16,
       ),
-      itemCount: items.length,
-      itemBuilder: (context, index) => items[index],
+      itemCount: rows.length + pinnedRows,
+      itemBuilder: (context, index) {
+        if (pinnedRows == 1 && index == 0) {
+          return _PinnedBox(
+            controller: controller,
+            alerts: pinned,
+            onTap: onTap,
+          );
+        }
+        final row = rows[index - pinnedRows];
+        final message = row.message;
+        if (message == null) {
+          return _DateHeader(row.header!);
+        }
+        return _NoticeRow(
+          key: ValueKey(message.msgId),
+          controller: controller,
+          message: message,
+          now: now,
+          onTap: onTap,
+        );
+      },
+    );
+  }
+}
+
+/// 表示・先読み範囲に入ったお知らせだけを画面用に読み取る。
+class _NoticeRow extends StatelessWidget {
+  const _NoticeRow({
+    super.key,
+    required this.controller,
+    required this.message,
+    required this.now,
+    required this.onTap,
+  });
+
+  final AppController controller;
+  final StoredMessage message;
+  final int now;
+  final ValueChanged<int> onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final m = message;
+    final env = m.envelope;
+    final body = env.notice;
+    final title = body?.title ?? '';
+    final training = isTrainingTitle(title);
+    final ended = env.supersedes != null && looksLikeEndTitle(title);
+    final localExpiry = controller.store.localExpiresAt(m);
+    final clockSuspicious =
+        !m.isLocal &&
+        (env.createdAt > m.receivedAt + 3600 ||
+            env.createdAt < m.receivedAt - 24 * 3600);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: KairanSizes.gap),
+      child: NoticeCard(
+        category: env.category,
+        role: env.role,
+        title: title,
+        place: body?.place ?? '',
+        textPreview: firstLineOf(body?.text ?? ''),
+        senderName: body?.senderName ?? '',
+        createdAt: dateTimeFromEpoch(env.createdAt),
+        isNew: !m.read,
+        retracted: m.retracted,
+        retractedByOfficial: m.retractedByOfficial,
+        superseded: m.supersededBy != null,
+        isLocal: m.isLocal,
+        rewrite: env.supersedes != null && !ended,
+        ended: ended,
+        training: training,
+        alert:
+            env.role == SenderRole.official &&
+            env.category.importance == NoticeImportance.urgent &&
+            !training,
+        endsAt: env.category.showsEndTime && !ended
+            ? dateTimeFromEpoch(env.expiresAt)
+            : null,
+        endingSoon: !ended && localExpiry - now <= 3600,
+        clockSuspicious: clockSuspicious,
+        asksReply: noticeAsksReply(body?.ext),
+        onTap: () => onTap(m.msgId),
+      ),
     );
   }
 }
