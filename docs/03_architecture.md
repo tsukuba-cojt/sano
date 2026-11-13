@@ -4,6 +4,8 @@ v2 は [08_use_cases.md](08_use_cases.md) の仕様変更 C01〜C25 を実装に
 
 大量受信時の保存確定・本部記録・受信待ちの設計は [11_bulk_data_reliability.md](11_bulk_data_reliability.md) を参照（v2.4）。
 
+1 万件での計測と、本部記録の差分保存・ログ整理・一覧の再利用・通信の再試行の改善は [12_capacity_measurements.md](12_capacity_measurements.md) に記録する。
+
 ## 1. スタック
 
 | 層 | 技術 | 理由 |

@@ -1,0 +1,73 @@
+{
+  "date": "2026-11-13",
+  "kind": "estimate_not_walking_measurement",
+  "historical_source": {
+    "document": "../10_test_spec.md",
+    "test_id": "S8",
+    "measurement_date": "2026-11-05",
+    "direction": "Mac to iPhone 17",
+    "before_changes_on_2026_11_13": true,
+    "samples": [
+      {
+        "messages": 30,
+        "reported_kb": 4.6,
+        "reported_seconds": 0.1
+      },
+      {
+        "messages": 300,
+        "reported_kb": 59,
+        "reported_seconds": 2.4
+      },
+      {
+        "messages": 1500,
+        "reported_seconds": 28,
+        "exchanges": 6,
+        "data": "TD3: text that compresses poorly"
+      }
+    ]
+  },
+  "assumptions": {
+    "moving_devices": 1,
+    "stationary_devices": 1,
+    "relative_speed_m_per_second": 1.2,
+    "closest_approach_m": 0,
+    "initial_discovery_and_connection_seconds": 3.0,
+    "messages_per_second_derived_from_1500_over_28": 53.57142857142857,
+    "same_payload_distribution_as_historical_sample": true,
+    "one_way_transfer": true,
+    "enough_missing_messages_to_send": true,
+    "constant_rate_while_in_range": true
+  },
+  "formula": "max(0, 2 * radius_m / relative_speed_m_per_second - initial_discovery_and_connection_seconds) * (1500 / 28)",
+  "scenarios": [
+    {
+      "assumed_reliable_radius_m": 5,
+      "time_in_range_seconds": 8.333333,
+      "time_after_initial_connection_seconds": 5.333333,
+      "estimated_messages": 285.714286,
+      "displayed_approximate_messages": 300
+    },
+    {
+      "assumed_reliable_radius_m": 10,
+      "time_in_range_seconds": 16.666667,
+      "time_after_initial_connection_seconds": 13.666667,
+      "estimated_messages": 732.142857,
+      "displayed_approximate_messages": 700
+    },
+    {
+      "assumed_reliable_radius_m": 20,
+      "time_in_range_seconds": 33.333333,
+      "time_after_initial_connection_seconds": 30.333333,
+      "estimated_messages": 1625.0,
+      "displayed_approximate_messages": 1600
+    }
+  ],
+  "not_verified": [
+    "reliable radio range for each phone and carrying position",
+    "initial discovery and connection delay",
+    "walking transfer counts",
+    "screen-off/background performance",
+    "transfer speed after the 2026-11-13 changes",
+    "other phone combinations and opposite direction"
+  ]
+}
