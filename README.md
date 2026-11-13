@@ -26,6 +26,8 @@
 | [docs/07_regulations.md](docs/07_regulations.md) | 関係する規制・ストア要件（Google Play / App Store / 日本の法令・ガイドライン）と対応状況 |
 | [docs/09_operations.md](docs/09_operations.md) | 運用手引き（下書き）: 平時の準備とコードの扱い、中継役の置き方、運び役、住民からの知らせ、公式の書き方、訓練、デマ対応、掲示の紙。実測待ちの値は実機テストで埋める（C16） |
 | [docs/08_use_cases.md](docs/08_use_cases.md) | ユースケース 74 件（誰が・いつ・何を、現行の ◯△✕）と v2 の仕様変更 C01〜C25（確定仕様・導入順・落とした案・変えないこと） |
+| [docs/10_test_spec.md](docs/10_test_spec.md) | 単体・結合・実機テストの仕様と実施記録 |
+| [docs/11_bulk_data_reliability.md](docs/11_bulk_data_reliability.md) | 大量受信時の仕様: 本部の記録、SOS の保護、保存失敗・容量不足、受信の上限、旧版との互換性、確認テスト |
 
 ## ビルド
 
@@ -43,7 +45,7 @@ Android SDK は `ANDROID_HOME` で指す（この環境では `/opt/homebrew/sha
 
 ```bash
 flutter analyze
-flutter test                         # ユニットテスト（封筒・圧縮・ストア・同期・UI、約 300 件）
+flutter test                         # ユニットテスト（封筒・圧縮・ストア・同期・UI）
 ```
 
 ### 実機なしで通信を試す

@@ -21,9 +21,10 @@ class Peer {
     this.sessionByteBudget = 65536,
     this.autoSession = true,
     this.caps = kDefaultCaps,
+    StoreBackend? backend,
   })  : transport = radio.createTransport(id),
         nodeId = nodeIdOf(index) {
-    store = MessageStore(MemoryStoreBackend());
+    store = MessageStore(backend ?? MemoryStoreBackend());
     transport.events.listen(_onEvent);
   }
 
@@ -145,7 +146,7 @@ void main() {
     final total = b.received.fold<int>(0, (n, c) => n + c.length);
     expect(b.received.every((c) => c.length <= 512), isTrue);
     // 1 件ずつ書けば 40 回を超える。詰めればほぼ total / 512 回。
-    expect(b.received.length, lessThan(total ~/ 512 + 8));
+    expect(b.received.length, lessThan(total ~/ 512 + 10));
     expect(framesOf(b.received).where((f) => f.type == FrameType.message).length,
         40);
   });
@@ -196,7 +197,7 @@ void main() {
     }
 
     // B が受け取ったフレーム列: HELLO, INVENTORY, INVENTORY_END, MESSAGE×5,
-    // MESSAGES_END, BYE。最後は BYE（開始側 A が送る）。
+    // MESSAGES_END, STORED（保存確認）, BYE。最後は BYE（開始側 A が送る）。
     final framesAtB = framesOf(b.received).map((f) => f.type).toList();
     expect(framesAtB.first, FrameType.hello);
     expect(framesAtB.last, FrameType.bye);
@@ -206,7 +207,9 @@ void main() {
     // 相手の在庫を受け取るまで MESSAGE は出さない: A は B の INVENTORY_END の
     // 後にだけ MESSAGE を送っている（B が受けたのも同じ順）。
     final framesAtA = framesOf(a.received).map((f) => f.type).toList();
-    expect(framesAtA.last, FrameType.messagesEnd);
+    expect(framesAtA.last, FrameType.stored);
+    expect(framesAtA.indexOf(FrameType.messagesEnd),
+        lessThan(framesAtA.indexOf(FrameType.stored)));
     expect(framesAtA, isNot(contains(FrameType.bye)));
 
     // リンクは閉じている。

@@ -12,6 +12,8 @@
 /// 全置換（圧縮）する。レコード形式はこのファイル内で閉じている。
 library;
 
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import '../core/categories.dart';
@@ -58,6 +60,14 @@ enum AddResult {
 
   /// 検証に失敗した、期限切れ、hop 超過など。
   rejected,
+}
+
+/// 保存できないときは受信成功にせず、既存の重要な記録を守る。
+class StoreCapacityException implements Exception {
+  const StoreCapacityException(this.message);
+  final String message;
+  @override
+  String toString() => message;
 }
 
 /// 保存されたメッセージ 1 件。
@@ -147,6 +157,21 @@ class StoredMessage {
     _wireCache = null;
   }
 
+  /// 保存前の作業コピー。書き込み中の変更を一覧や通信から見せない。
+  StoredMessage copy() =>
+      StoredMessage(
+          envelope: envelope,
+          receivedAt: receivedAt,
+          isLocal: isLocal,
+          read: read,
+          supersededBy: supersededBy,
+          retracted: retracted,
+          retractedByOfficial: retractedByOfficial,
+          retainUntil: retainUntil,
+        )
+        ..staleInfo = staleInfo
+        .._wireCache = _wireCache;
+
   @override
   String toString() =>
       'StoredMessage(${_envelope.kind.name}, msgId: 0x${msgId.toRadixString(16)}, '
@@ -185,6 +210,28 @@ class MessageStore extends ChangeNotifier {
 
   /// supersedes 付き notice の対象 msg_id → 上書きする notice の msg_id 群。
   final Map<int, Set<int>> _supersedeTargets = <int, Set<int>>{};
+
+  /// 返信先 → ack ID。報告ごとに全件を走査しない。
+  final Map<int, Set<int>> _ackTargets = <int, Set<int>>{};
+
+  /// 本部受信箱などへの先行保存。失敗したら中継ストアも公開しない。
+  Future<void> Function(
+    MessageStore stagedStore,
+    List<StoredMessage> additions,
+    int now,
+  )?
+  beforeCommit;
+
+  /// 中継枠から外れていても、専用受信箱で保存済みの ID。
+  bool Function(int msgId)? externallyStored;
+
+  bool isDurablyStored(int msgId) =>
+      contains(msgId) || (externallyStored?.call(msgId) ?? false);
+
+  String? lastStorageError;
+  Future<void> _mutations = Future<void>.value();
+  bool _needsRepair = false;
+  final List<StoredMessage> _additions = [];
 
   /// 参加中のグループ ID。削除順の判定（未参加グループを先に捨てる）に使う。
   /// [AppController] が同期する。
@@ -240,6 +287,7 @@ class MessageStore extends ChangeNotifier {
     _messages.clear();
     _tombstoneTargets.clear();
     _supersedeTargets.clear();
+    _ackTargets.clear();
     var needsCompaction = false;
     for (final record in records) {
       try {
@@ -278,6 +326,15 @@ class MessageStore extends ChangeNotifier {
     Envelope envelope, {
     required int now,
     bool isLocal = false,
+  }) => _transaction(
+    (draft) => draft._add(envelope, now: now, isLocal: isLocal),
+    now: now,
+  );
+
+  Future<AddResult> _add(
+    Envelope envelope, {
+    required int now,
+    required bool isLocal,
   }) async {
     final r = _insert(envelope, now: now, isLocal: isLocal);
     if (r.result != AddResult.added) {
@@ -294,6 +351,19 @@ class MessageStore extends ChangeNotifier {
     Iterable<Envelope> envelopes, {
     required int now,
     bool isLocal = false,
+  }) {
+    // 呼び出し元が待っている間に iterable を変えても、内容を変えない。
+    final batch = List<Envelope>.of(envelopes);
+    return _transaction(
+      (draft) => draft._addAll(batch, now: now, isLocal: isLocal),
+      now: now,
+    );
+  }
+
+  Future<int> _addAll(
+    Iterable<Envelope> envelopes, {
+    required int now,
+    required bool isLocal,
   }) async {
     final records = <Uint8List>[];
     var compact = false;
@@ -316,7 +386,10 @@ class MessageStore extends ChangeNotifier {
 
   /// [test] に合うものをこの端末から消す（実機テスト用データの片付け、#152）。
   /// 取り消し（tombstone）は出さないので、ほかの端末には残る。消した件数を返す。
-  Future<int> removeWhere(bool Function(StoredMessage m) test) async {
+  Future<int> removeWhere(bool Function(StoredMessage m) test) =>
+      _transaction((draft) => draft._removeWhere(test));
+
+  Future<int> _removeWhere(bool Function(StoredMessage m) test) async {
     final victims = _messages.values.where(test).toList();
     if (victims.isEmpty) {
       return 0;
@@ -362,7 +435,11 @@ class MessageStore extends ChangeNotifier {
           case MessageKind.tombstone:
           case MessageKind.ack:
             if (envelope.supersedes == null || envelope.bodyPlain.isNotEmpty) {
-              return (result: AddResult.rejected, records: none, compact: false);
+              return (
+                result: AddResult.rejected,
+                records: none,
+                compact: false,
+              );
             }
           case MessageKind.unknown:
             return (result: AddResult.rejected, records: none, compact: false);
@@ -383,7 +460,7 @@ class MessageStore extends ChangeNotifier {
         envelope.role == SenderRole.resident) {
       removed.addAll(_capResidentNotices(envelope.groupId, now));
     }
-    removed.addAll(_makeRoom(now));
+    removed.addAll(_makeRoom(now, incoming: envelope));
 
     final message = StoredMessage(
       envelope: envelope,
@@ -391,6 +468,7 @@ class MessageStore extends ChangeNotifier {
       isLocal: isLocal,
     );
     _messages[envelope.msgId] = message;
+    _additions.add(message);
     if (envelope.isOpaque) {
       _opaqueCount++;
     }
@@ -413,7 +491,9 @@ class MessageStore extends ChangeNotifier {
     return (
       result: AddResult.added,
       records: records,
-      compact: erased || removed.length >= 50,
+      // remove→add の途中で終了しても、元の SOS だけが消えて返信が残らない
+      // 状態を作らない。削除を伴う更新は一時ファイルからの全置換で確定する。
+      compact: erased || removed.isNotEmpty,
     );
   }
 
@@ -449,6 +529,9 @@ class MessageStore extends ChangeNotifier {
   bool _indexNew(StoredMessage message, List<StoredMessage> touched) {
     final env = message.envelope;
     final target = env.supersedes;
+    if (env.kind == MessageKind.ack && target != null) {
+      _ackTargets.putIfAbsent(target, () => <int>{}).add(env.msgId);
+    }
     var erased = false;
     if (target != null) {
       if (env.kind == MessageKind.tombstone) {
@@ -519,7 +602,8 @@ class MessageStore extends ChangeNotifier {
           if (s != null &&
               s.groupId == env.groupId &&
               _mayApply(s.envelope, message)) {
-            if (best == null || s.envelope.createdAt > best.envelope.createdAt) {
+            if (best == null ||
+                s.envelope.createdAt > best.envelope.createdAt) {
               best = s;
             }
             if ((s.retainUntil ?? 0) < retainUntil) {
@@ -554,6 +638,7 @@ class MessageStore extends ChangeNotifier {
   void _rebuildIndexes() {
     _tombstoneTargets.clear();
     _supersedeTargets.clear();
+    _ackTargets.clear();
     for (final m in _messages.values) {
       final target = m.envelope.supersedes;
       if (target == null || m.isOpaque) {
@@ -563,6 +648,8 @@ class MessageStore extends ChangeNotifier {
         _tombstoneTargets.putIfAbsent(target, () => <int>{}).add(m.msgId);
       } else if (m.kind == MessageKind.notice) {
         _supersedeTargets.putIfAbsent(target, () => <int>{}).add(m.msgId);
+      } else if (m.kind == MessageKind.ack) {
+        _ackTargets.putIfAbsent(target, () => <int>{}).add(m.msgId);
       }
     }
     for (final m in _messages.values) {
@@ -669,7 +756,7 @@ class MessageStore extends ChangeNotifier {
 
   /// 上限に収まるよう削除する（追加前に呼ぶ）。満杯なら 10% をまとめて削除する。
   /// 削除したものを返す。
-  List<StoredMessage> _makeRoom(int now) {
+  List<StoredMessage> _makeRoom(int now, {required Envelope incoming}) {
     if (_messages.length < maxMessages) {
       return const [];
     }
@@ -678,29 +765,53 @@ class MessageStore extends ChangeNotifier {
     if (excess < batch) {
       excess = batch;
     }
-    final candidates = _messages.values.toList()
-      ..sort((a, b) {
-        final ta = _evictionTier(a, now);
-        final tb = _evictionTier(b, now);
-        if (ta != tb) {
-          return ta.compareTo(tb);
-        }
-        final r = a.receivedAt.compareTo(b.receivedAt);
-        if (r != 0) {
-          return r;
-        }
-        final c = a.envelope.createdAt.compareTo(b.envelope.createdAt);
-        if (c != 0) {
-          return c;
-        }
-        return a.msgId.compareTo(b.msgId);
-      });
+    final candidates =
+        _messages.values
+            .where(
+              (m) =>
+                  !_isProtectedSos(m, now) ||
+                  (incoming.kind == MessageKind.ack &&
+                      incoming.supersedes == m.msgId &&
+                      incoming.groupId == m.groupId &&
+                      incoming.role.code >= SenderRole.staff.code),
+            )
+            .toList()
+          ..sort((a, b) {
+            final ta = _evictionTier(a, now);
+            final tb = _evictionTier(b, now);
+            if (ta != tb) {
+              return ta.compareTo(tb);
+            }
+            final r = a.receivedAt.compareTo(b.receivedAt);
+            if (r != 0) {
+              return r;
+            }
+            final c = a.envelope.createdAt.compareTo(b.envelope.createdAt);
+            if (c != 0) {
+              return c;
+            }
+            return a.msgId.compareTo(b.msgId);
+          });
+    if (candidates.isEmpty) {
+      throw const StoreCapacityException(
+        '保存が いっぱいです。未確認の SOS を 残すため、新しい 情報を 保存できませんでした。',
+      );
+    }
     final removed = candidates.take(excess).toList();
     for (final m in removed) {
       _remove(m);
     }
     return removed;
   }
+
+  bool _isProtectedSos(StoredMessage m, int now) =>
+      !m.isOpaque &&
+      !m.isStub &&
+      !m.retracted &&
+      !isExpired(m, now) &&
+      m.kind == MessageKind.help &&
+      ReportInfo.decode(m.envelope.help?.ext)?.type == ReportType.sos &&
+      ackFor(m.msgId) == null;
 
   /// 不透明メッセージが上限なら最も古いものを削除する。
   List<StoredMessage> _makeRoomForOpaque() {
@@ -773,8 +884,11 @@ class MessageStore extends ChangeNotifier {
     }
     final target = m.envelope.supersedes;
     if (target != null) {
-      _tombstoneTargets[target]?.remove(m.msgId);
-      _supersedeTargets[target]?.remove(m.msgId);
+      for (final index in [_tombstoneTargets, _supersedeTargets, _ackTargets]) {
+        final ids = index[target];
+        ids?.remove(m.msgId);
+        if (ids != null && ids.isEmpty) index.remove(target);
+      }
     }
     if (m.kind == MessageKind.groupInfo) {
       _refreshInfoStaleness(m.groupId);
@@ -792,7 +906,10 @@ class MessageStore extends ChangeNotifier {
   }
 
   /// 期限切れを削除する。
-  Future<void> purgeExpired(int now) async {
+  Future<void> purgeExpired(int now) =>
+      _transaction((draft) => draft._purgeExpired(now), now: now);
+
+  Future<void> _purgeExpired(int now) async {
     final expired = _messages.values.where((m) => isExpired(m, now)).toList();
     if (expired.isEmpty) {
       return;
@@ -801,10 +918,9 @@ class MessageStore extends ChangeNotifier {
       _remove(m);
     }
     _dirtyRecords += expired.length;
-    await _persistRecords(
-      [for (final m in expired) _encodeRemove(m.msgId)],
-      forceCompactIf: expired.length >= 50,
-    );
+    await _persistRecords([
+      for (final m in expired) _encodeRemove(m.msgId),
+    ], forceCompactIf: expired.length >= 50);
     notifyListeners();
   }
 
@@ -852,7 +968,10 @@ class MessageStore extends ChangeNotifier {
 
   /// 目録を選ぶ。[small]（maxChunk が小さい）なら受信時刻の新しい順に
   /// [kSmallChunkInventoryLimit] 件へ絞り、最古の created_at を返す（C08）。
-  InventorySelection inventorySelection({required int now, bool small = false}) {
+  InventorySelection inventorySelection({
+    required int now,
+    bool small = false,
+  }) {
     if (!small) {
       return InventorySelection(inventory(now: now));
     }
@@ -868,16 +987,16 @@ class MessageStore extends ChangeNotifier {
         cutoff = m.envelope.createdAt;
       }
     }
-    return InventorySelection([for (final m in chosen) m.msgId],
-        cutoffCreatedAt: cutoff);
+    return InventorySelection([
+      for (final m in chosen) m.msgId,
+    ], cutoffCreatedAt: cutoff);
   }
 
   /// 「受け取りました」が届いている知らせ（kind=help）の msg_id。
-  Set<int> _ackedTargets() => <int>{
-        for (final m in _messages.values)
-          if (m.kind == MessageKind.ack && m.envelope.supersedes != null)
-            m.envelope.supersedes!,
-      };
+  Set<int> _ackedTargets() => {
+    for (final id in _ackTargets.keys)
+      if (ackFor(id) != null) id,
+  };
 
   /// 送る順の段（小さいほど先、v2.3）。すれ違いが短くても大事なものから渡す。
   ///
@@ -966,25 +1085,27 @@ class MessageStore extends ChangeNotifier {
       return true;
     }).toList();
     final acked = _ackedTargets();
-    final tiers = <int, int>{for (final m in missing) m.msgId: _sendTier(m, acked)};
+    final tiers = <int, int>{
+      for (final m in missing) m.msgId: _sendTier(m, acked),
+    };
     missing.sort((a, b) {
-        final k = tiers[a.msgId]!.compareTo(tiers[b.msgId]!);
-        if (k != 0) {
-          return k;
+      final k = tiers[a.msgId]!.compareTo(tiers[b.msgId]!);
+      if (k != 0) {
+        return k;
+      }
+      if (peerGroups != null) {
+        final ga = peerGroups.contains(a.groupId) ? 0 : 1;
+        final gb = peerGroups.contains(b.groupId) ? 0 : 1;
+        if (ga != gb) {
+          return ga.compareTo(gb);
         }
-        if (peerGroups != null) {
-          final ga = peerGroups.contains(a.groupId) ? 0 : 1;
-          final gb = peerGroups.contains(b.groupId) ? 0 : 1;
-          if (ga != gb) {
-            return ga.compareTo(gb);
-          }
-        }
-        final r = b.envelope.role.code.compareTo(a.envelope.role.code);
-        if (r != 0) {
-          return r;
-        }
-        return _newestFirst(a, b);
-      });
+      }
+      final r = b.envelope.role.code.compareTo(a.envelope.role.code);
+      if (r != 0) {
+        return r;
+      }
+      return _newestFirst(a, b);
+    });
     return missing;
   }
 
@@ -1010,35 +1131,61 @@ class MessageStore extends ChangeNotifier {
     bool recent(StoredMessage m) =>
         (m.isLocal ? m.envelope.createdAt : m.receivedAt) >= since;
     bool ok(StoredMessage m) =>
-        !skip.contains(m.msgId) && recent(m) && _isRelayable(m, now) && !m.retracted;
+        !skip.contains(m.msgId) &&
+        recent(m) &&
+        _isRelayable(m, now) &&
+        !m.retracted;
     final acked = _ackedTargets();
     List<StoredMessage> pick(bool Function(StoredMessage m) test) =>
-        _messages.values.where((m) => ok(m) && test(m)).toList()..sort(_newestFirst);
+        _messages.values.where((m) => ok(m) && test(m)).toList()
+          ..sort(_newestFirst);
 
-    final sos = pick((m) =>
-        m.kind == MessageKind.help &&
-        !acked.contains(m.msgId) &&
-        _sendTier(m, acked) == 0);
-    final alerts = pick((m) => m.kind == MessageKind.notice && _sendTier(m, acked) == 0);
-    final tombstones = pick((m) =>
-        m.kind == MessageKind.tombstone && joinedGroupIds.contains(m.groupId));
+    final sos = pick(
+      (m) =>
+          m.kind == MessageKind.help &&
+          !acked.contains(m.msgId) &&
+          _sendTier(m, acked) == 0,
+    );
+    final alerts = pick(
+      (m) => m.kind == MessageKind.notice && _sendTier(m, acked) == 0,
+    );
+    final tombstones = pick(
+      (m) =>
+          m.kind == MessageKind.tombstone && joinedGroupIds.contains(m.groupId),
+    );
     final infos = <StoredMessage>[];
     for (final g in joinedGroupIds) {
       final info = latestGroupInfo(g);
-      if (info != null && !skip.contains(info.msgId) && _isRelayable(info, now)) {
+      if (info != null &&
+          !skip.contains(info.msgId) &&
+          _isRelayable(info, now)) {
         infos.add(info);
       }
     }
-    final reports = pick((m) =>
-        m.kind == MessageKind.help && m.isLocal && !acked.contains(m.msgId));
-    final acks = pick((m) => m.kind == MessageKind.ack && joinedGroupIds.contains(m.groupId));
-    final officials = pick((m) =>
-        m.kind == MessageKind.notice &&
-        m.envelope.role == SenderRole.official &&
-        joinedGroupIds.contains(m.groupId));
+    final reports = pick(
+      (m) =>
+          m.kind == MessageKind.help && m.isLocal && !acked.contains(m.msgId),
+    );
+    final acks = pick(
+      (m) => m.kind == MessageKind.ack && joinedGroupIds.contains(m.groupId),
+    );
+    final officials = pick(
+      (m) =>
+          m.kind == MessageKind.notice &&
+          m.envelope.role == SenderRole.official &&
+          joinedGroupIds.contains(m.groupId),
+    );
     final out = <StoredMessage>[];
     final seen = <int>{};
-    for (final list in [sos, alerts, tombstones, infos, reports, acks, officials]) {
+    for (final list in [
+      sos,
+      alerts,
+      tombstones,
+      infos,
+      reports,
+      acks,
+      officials,
+    ]) {
       for (final m in list) {
         if (seen.add(m.msgId)) {
           out.add(m);
@@ -1051,7 +1198,6 @@ class MessageStore extends ChangeNotifier {
     return out;
   }
 
-
   /// 表示対象の notice（期限内・未取消・未上書き）を新しい順に返す。
   /// [groupIds] を渡すとそのグループだけに絞る。[byReceived] なら届いた時刻の順。
   List<StoredMessage> visibleNotices({
@@ -1059,33 +1205,46 @@ class MessageStore extends ChangeNotifier {
     Set<int>? groupIds,
     bool byReceived = false,
   }) {
-    final list = _messages.values
-        .where((m) =>
-            m.kind == MessageKind.notice &&
-            isDisplayable(m, now) &&
-            (groupIds == null || groupIds.contains(m.groupId)))
-        .toList()
-      ..sort(byReceived ? _newestReceivedFirst : _newestFirst);
+    final list =
+        _messages.values
+            .where(
+              (m) =>
+                  m.kind == MessageKind.notice &&
+                  isDisplayable(m, now) &&
+                  (groupIds == null || groupIds.contains(m.groupId)),
+            )
+            .toList()
+          ..sort(byReceived ? _newestReceivedFirst : _newestFirst);
     return list;
   }
 
   /// 表示対象の困りごと（kind=help）を新しい順に返す（C21）。
-  List<StoredMessage> visibleHelpRequests({required int now, Set<int>? groupIds}) {
-    final list = _messages.values
-        .where((m) =>
-            m.kind == MessageKind.help &&
-            isDisplayable(m, now) &&
-            (groupIds == null || groupIds.contains(m.groupId)))
-        .toList()
-      ..sort(_newestFirst);
+  List<StoredMessage> visibleHelpRequests({
+    required int now,
+    Set<int>? groupIds,
+  }) {
+    final list =
+        _messages.values
+            .where(
+              (m) =>
+                  m.kind == MessageKind.help &&
+                  isDisplayable(m, now) &&
+                  (groupIds == null || groupIds.contains(m.groupId)),
+            )
+            .toList()
+          ..sort(_newestFirst);
     return list;
   }
 
   /// [msgId] への「受け取りました」（kind=ack）。なければ null。
   StoredMessage? ackFor(int msgId) {
     StoredMessage? best;
-    for (final m in _messages.values) {
-      if (m.kind != MessageKind.ack || m.envelope.supersedes != msgId) {
+    final target = _messages[msgId];
+    for (final id in _ackTargets[msgId] ?? const <int>{}) {
+      final m = _messages[id];
+      if (m == null ||
+          m.envelope.role.code < SenderRole.staff.code ||
+          (target != null && m.groupId != target.groupId)) {
         continue;
       }
       if (best == null || _newestFirst(m, best) < 0) {
@@ -1100,7 +1259,9 @@ class MessageStore extends ChangeNotifier {
     StoredMessage? best;
     GroupInfoBody? bestBody;
     for (final m in _messages.values) {
-      if (m.kind != MessageKind.groupInfo || m.groupId != groupId || m.isOpaque) {
+      if (m.kind != MessageKind.groupInfo ||
+          m.groupId != groupId ||
+          m.isOpaque) {
         continue;
       }
       final GroupInfoBody body;
@@ -1151,13 +1312,16 @@ class MessageStore extends ChangeNotifier {
 
   /// 未読の表示対象 notice の数。
   int unreadCount({required int now, Set<int>? groupIds}) =>
-      visibleNotices(now: now, groupIds: groupIds)
-          .where((m) => !m.read)
-          .length;
+      visibleNotices(now: now, groupIds: groupIds).where((m) => !m.read).length;
 
   Future<void> markRead(int msgId) => markAllRead({msgId});
 
-  Future<void> markAllRead(Set<int> msgIds) async {
+  Future<void> markAllRead(Set<int> msgIds) {
+    final ids = Set<int>.of(msgIds);
+    return _transaction((draft) => draft._markAllRead(ids));
+  }
+
+  Future<void> _markAllRead(Set<int> msgIds) async {
     final changed = <StoredMessage>[];
     for (final id in msgIds) {
       final m = _messages[id];
@@ -1178,8 +1342,104 @@ class MessageStore extends ChangeNotifier {
   // 永続化
   // ---------------------------------------------------------------------------
 
-  Future<void> _persistRecords(List<Uint8List> records,
-      {bool forceCompactIf = false}) {
+  /// 判定・変更・保存を一つずつ実行する。I/O だけの直列化では、保存前の
+  /// データが別セッションの目録に出たり、失敗した変更が残ってしまう。
+  Future<T> _transaction<T>(
+    Future<T> Function(MessageStore draft) action, {
+    int now = 0,
+  }) {
+    final next = _mutations.then((_) async {
+      final staged = _StagedStoreBackend();
+      final draft = MessageStore(staged, maxMessages: maxMessages)
+        ..joinedGroupIds = Set.of(joinedGroupIds)
+        ..officialGroupIds = Set.of(officialGroupIds)
+        .._version = _version
+        .._opaqueCount = _opaqueCount
+        .._dirtyRecords = _dirtyRecords;
+      draft._messages.addAll({
+        for (final m in _messages.values) m.msgId: m.copy(),
+      });
+      void copyIndex(Map<int, Set<int>> from, Map<int, Set<int>> to) {
+        to.addAll({
+          for (final entry in from.entries) entry.key: Set.of(entry.value),
+        });
+      }
+
+      copyIndex(_tombstoneTargets, draft._tombstoneTargets);
+      copyIndex(_supersedeTargets, draft._supersedeTargets);
+      copyIndex(_ackTargets, draft._ackTargets);
+      try {
+        final result = await action(draft);
+        if (!staged.changed) return result;
+        if (draft._additions.isNotEmpty) {
+          await beforeCommit?.call(
+            draft,
+            List.unmodifiable(draft._additions),
+            now,
+          );
+        }
+        // 直前の追記が途中まで書けていた可能性がある。公開済み状態へ戻して
+        // から次の変更を保存し、失敗した追加を後続の保存に混ぜない。
+        if (_needsRepair) {
+          await _backend.rewrite(_snapshotRecords());
+          _needsRepair = false;
+        }
+        try {
+          await staged.commit(_backend);
+        } on Object {
+          _needsRepair = true;
+          rethrow;
+        }
+        // 既に詳細画面などが参照している StoredMessage の同一性は保つ。
+        for (final entry in draft._messages.entries) {
+          final old = _messages[entry.key];
+          if (old == null) continue;
+          final value = entry.value;
+          old
+            .._envelope = value._envelope
+            .._wireCache = value._wireCache
+            ..read = value.read
+            ..supersededBy = value.supersededBy
+            ..retracted = value.retracted
+            ..retractedByOfficial = value.retractedByOfficial
+            ..retainUntil = value.retainUntil
+            ..staleInfo = value.staleInfo;
+          draft._messages[entry.key] = old;
+        }
+        _messages
+          ..clear()
+          ..addAll(draft._messages);
+        _tombstoneTargets
+          ..clear()
+          ..addAll(draft._tombstoneTargets);
+        _supersedeTargets
+          ..clear()
+          ..addAll(draft._supersedeTargets);
+        _ackTargets
+          ..clear()
+          ..addAll(draft._ackTargets);
+        _version = draft._version;
+        _opaqueCount = draft._opaqueCount;
+        _dirtyRecords = draft._dirtyRecords;
+        lastStorageError = null;
+        notifyListeners();
+        return result;
+      } on Object catch (e) {
+        lastStorageError = e is StoreCapacityException
+            ? e.message
+            : '情報を 保存できませんでした。端末の 空き容量を 確かめてください。';
+        notifyListeners();
+        rethrow;
+      }
+    });
+    _mutations = next.then((_) {}, onError: (Object _) {});
+    return next;
+  }
+
+  Future<void> _persistRecords(
+    List<Uint8List> records, {
+    bool forceCompactIf = false,
+  }) {
     final compact = forceCompactIf || _dirtyRecords > _compactThreshold;
     return _enqueueIo(() async {
       if (compact) {
@@ -1194,9 +1454,9 @@ class MessageStore extends ChangeNotifier {
   }
 
   Future<void> _compact() => _enqueueIo(() async {
-        _dirtyRecords = 0;
-        await _backend.rewrite(_snapshotRecords());
-      });
+    _dirtyRecords = 0;
+    await _backend.rewrite(_snapshotRecords());
+  });
 
   Future<void> _enqueueIo(Future<void> Function() op) {
     final next = _io.then((_) => op());
@@ -1204,8 +1464,9 @@ class MessageStore extends ChangeNotifier {
     return next;
   }
 
-  List<Uint8List> _snapshotRecords() =>
-      [for (final m in _messages.values) _encodeAdd(m)];
+  List<Uint8List> _snapshotRecords() => [
+    for (final m in _messages.values) _encodeAdd(m),
+  ];
 
   // --- レコード形式 ---------------------------------------------------------
   //
@@ -1367,3 +1628,34 @@ class MessageStore extends ChangeNotifier {
 }
 
 enum _RecordType { add, update, remove }
+
+/// 作業コピーの変更をまとめ、公開前に実バックエンドへ一度だけ書く。
+class _StagedStoreBackend implements StoreBackend {
+  final List<Uint8List> _append = [];
+  List<Uint8List>? _replacement;
+  bool get changed => _replacement != null || _append.isNotEmpty;
+
+  @override
+  Future<List<Uint8List>> readAll() async => throw StateError('作業用ストアは読み込めません');
+  @override
+  Future<void> append(Uint8List record) async => _append.add(record);
+  @override
+  Future<void> appendAll(List<Uint8List> records) async =>
+      _append.addAll(records);
+  @override
+  Future<void> rewrite(List<Uint8List> records) async {
+    _replacement = records;
+    _append.clear();
+  }
+
+  Future<void> commit(StoreBackend backend) async {
+    final replacement = _replacement;
+    if (replacement != null) {
+      await backend.rewrite([...replacement, ..._append]);
+    } else if (_append.length == 1) {
+      await backend.append(_append.single);
+    } else if (_append.isNotEmpty) {
+      await backend.appendAll(_append);
+    }
+  }
+}

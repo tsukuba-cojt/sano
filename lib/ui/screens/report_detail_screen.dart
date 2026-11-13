@@ -91,9 +91,9 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
     return Scaffold(
       appBar: const KairanAppBar(title: '知らせ', showBack: true),
       body: ListenableBuilder(
-        listenable: Listenable.merge([_c.store, _c.groups]),
+        listenable: Listenable.merge([_c, _c.store, _c.groups]),
         builder: (context, _) {
-          final m = _c.store.get(widget.msgId);
+          final m = _c.reportMessage(widget.msgId);
           final e = m == null ? null : _c.reportEntryOf(m);
           if (m == null || e == null || m.retracted) {
             return const PageBody(
@@ -119,7 +119,7 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
           final expires = dateTimeFromEpoch(_c.store.localExpiresAt(m));
 
           Widget? bottom;
-          if (manager && ack == null) {
+          if (manager && (ack == null || e.replyPending) && !e.expired) {
             bottom = PrimaryButton(
               label: '受け取りました と 返す',
               icon: Icons.check,
@@ -149,7 +149,18 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
               const SizedBox(height: 12),
               SelectableText(e.body.title, style: KairanTextStyles.noticeTitle),
               const SizedBox(height: 12),
-              if (ack != null)
+              if (e.expired)
+                const InfoBox(
+                  '期限が 切れた 知らせの 記録です。今の 安否では ありません。新しい 知らせを 確かめてください。',
+                  title: '過去の 記録',
+                  kind: InfoKind.caution,
+                )
+              else if (e.replyPending)
+                const InfoBox(
+                  '返信を 広げる 準備が できていません。空き容量を 確かめて、もう一度 返してください。',
+                  kind: InfoKind.caution,
+                )
+              else if (ack != null)
                 InfoBox(
                   mine
                       ? '${_c.ackSenderLabel(ack)}が 受け取りました（${formatDayTimeJa(dateTimeFromEpoch(ack.envelope.createdAt), now: now)}）。'

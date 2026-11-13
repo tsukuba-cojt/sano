@@ -334,6 +334,7 @@ void main() {
     await b.joinGroup(g.code);
     await meet('B', 'HQ');
 
+    hqPlatform.shown.clear();
     await b.sendReport(
       groupCode: g.code,
       type: ReportType.sos,
@@ -344,7 +345,6 @@ void main() {
     await b.sendReport(groupCode: g.code, type: ReportType.safe, people: 1);
     await b.sendReport(groupCode: g.code, type: ReportType.home, people: 3);
 
-    hqPlatform.shown.clear();
     await meet('HQ', 'B');
     final sos = hqPlatform.shown
         .where((s) => s.importance == NoticeImportance.urgent)
@@ -362,12 +362,12 @@ void main() {
 
     // 前面の本部端末は通知しない（ホームの帯で知らせる）。
     hq.setForeground(true);
+    bPlatform.shown.clear();
     for (final e in hq.receivedReports()) {
       await hq.acknowledgeReport(e.msgId);
     }
     expect(hq.unackedSosCount, 0);
 
-    bPlatform.shown.clear();
     await meet('B', 'HQ');
     final acks = bPlatform.shown
         .where((s) => s.title == '防災課が 受け取りました')

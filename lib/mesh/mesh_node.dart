@@ -11,6 +11,7 @@ import '../core/epoch.dart';
 import '../core/frames.dart';
 import '../core/ids.dart';
 import 'message_store.dart';
+import 'receive_budget.dart';
 import 'sync_session.dart';
 import 'transport.dart';
 
@@ -211,6 +212,7 @@ class MeshNode extends ChangeNotifier {
 
   final Transport _transport;
   final MessageStore _store;
+  final ReceiveBudget _receiveBudget = ReceiveBudget();
 
   /// このノードの ID（8 バイト）。
   final Uint8List nodeId;
@@ -719,6 +721,7 @@ class MeshNode extends ChangeNotifier {
       onPeerTime: _onPeerTime,
       cannotReachPeer: _cannotReach,
       knownPeerIds: (node) => _peerKnown[hexOf(node)]?.ids,
+      receiveBudget: _receiveBudget,
     );
     _sessions[e.linkId] = session;
     _totalSessions++;
@@ -854,8 +857,8 @@ class MeshNode extends ChangeNotifier {
         '送信 ${session.messagesSent} 件${session.hasMore ? '（続きあり）' : ''}',
       );
       onSyncCompleted?.call(t, session.messagesSent, session.messagesReceived);
-      if (hex != null && session.messagesSent > 0) {
-        onHanded?.call(hex, session.sentMessageIds, t);
+      if (hex != null && session.confirmedSentMessageIds.isNotEmpty) {
+        onHanded?.call(hex, session.confirmedSentMessageIds, t);
       }
       if (session.hasMore) {
         // 打ち切った続きを少し待って同期する（相手が接続してくる場合もある）。
