@@ -23,6 +23,7 @@ import '../widgets/section.dart';
 enum ReportFilter {
   all('すべて'),
   unacked('まだ 返事を していない'),
+  sending('自動送信待ち'),
   sos('SOS'),
   safe('無事'),
   home('在宅避難'),
@@ -37,7 +38,9 @@ enum ReportFilter {
       case ReportFilter.all:
         return true;
       case ReportFilter.unacked:
-        return !e.acked || e.replyPending;
+        return !e.acked;
+      case ReportFilter.sending:
+        return e.replyPending;
       case ReportFilter.sos:
         return e.info.type == ReportType.sos;
       case ReportFilter.safe:
@@ -86,9 +89,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
   }
 
   Future<void> _ackAll(List<ReportEntry> entries) async {
-    final pending = entries
-        .where((e) => (!e.acked || e.replyPending) && !e.expired)
-        .toList();
+    final pending = entries.where((e) => !e.acked && !e.expired).toList();
     if (pending.isEmpty) {
       return;
     }
@@ -126,25 +127,17 @@ class _ReportsScreenState extends State<ReportsScreen> {
             .where((e) => ids.contains(e.msgId) && e.acked)
             .toList();
         final waiting = recorded.where((e) => e.replyPending).length;
-        final ready = recorded.length - waiting;
-        if (waiting > 0) {
-          await showMessageDialog(
-            context,
-            title: '返信を 記録しました',
-            message:
-                '返信の 記録: ${formatCountJa(recorded.length, '件')}\n'
-                '近くへ 広げる 準備が できた返信: ${formatCountJa(ready, '件')}\n'
-                '準備待ちの 返信: ${formatCountJa(waiting, '件')}\n\n'
-                '相手への 到着を 確認した 件数では ありません。'
-                '準備待ちは「まだ 返事を していない」から もう一度 試せます。',
-          );
-        } else {
-          showSnack(
-            context,
-            '${formatCountJa(recorded.length, '件')}の 返信を 保存しました。'
-            '近くの スマホと 交換すると 広がります。',
-          );
-        }
+        final handed = recorded.where((e) => e.replyHandedAt != null).length;
+        await showMessageDialog(
+          context,
+          title: '返信を 保存しました',
+          message:
+              '保存した 返信: ${formatCountJa(recorded.length, '件')}\n'
+              '自動送信待ち: ${formatCountJa(waiting, '件')}\n'
+              '近くの スマホで 保存を 確認: ${formatCountJa(handed, '件')}\n\n'
+              '通信が できるときに 自動で 送ります。'
+              '近くでの 保存確認は、本人への 到着や 対応完了を 示すものでは ありません。',
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -171,15 +164,18 @@ class _ReportsScreenState extends State<ReportsScreen> {
       body: ListenableBuilder(
         listenable: Listenable.merge([_c, _c.store, _c.groups]),
         builder: (context, _) {
+          final showingPending = _filter == ReportFilter.sending;
           final received = _c.receivedReports(
             groupCode: widget.groupCode,
             inReplyTo: widget.inReplyTo,
-            includeExpired: _showHistory,
+            includeExpired: _showHistory || showingPending,
           );
           final all = _showHistory
               ? received.where((e) => e.expired).toList()
+              : showingPending
+              ? received.where((e) => e.replyPending).toList()
               : received;
-          final summary = _showHistory
+          final summary = _showHistory || showingPending
               ? AppController.summarize(all)
               : _c.receivedReportSummary(
                   groupCode: widget.groupCode,
@@ -190,9 +186,9 @@ class _ReportsScreenState extends State<ReportsScreen> {
           final request = widget.inReplyTo == null
               ? null
               : _c.store.get(widget.inReplyTo!)?.envelope.notice;
-          final unacked = shown
-              .where((e) => (!e.acked || e.replyPending) && !e.expired)
-              .length;
+          final unacked = shown.where((e) => !e.acked && !e.expired).length;
+          final sending = all.where((e) => e.replyPending).length;
+          final handed = all.where((e) => e.replyHandedAt != null).length;
           final header = <Widget>[
             if (_c.storageError != null)
               InfoBox(
@@ -207,27 +203,38 @@ class _ReportsScreenState extends State<ReportsScreen> {
                 title: '過去の 記録',
                 kind: InfoKind.caution,
               ),
-            if (!_showHistory && summary.unackedSos > 0)
+            if (!_showHistory && !showingPending && summary.unackedSos > 0)
               InfoBox(
                 'まだ 返事を していない SOS が ${formatCountJa(summary.unackedSos, '件')} あります。'
                 '場所を 確かめて、係の 人を 向かわせてください。',
                 title: 'SOS',
                 kind: InfoKind.danger,
               ),
-            InfoBox(
-              '${summary.line()}\nまだ 返事を していない: ${formatCountJa(summary.unacked, '件')}',
-              title: _showHistory
-                  ? '過去の 記録 ${formatCountJa(summary.total, '件')}'
-                  : '届いた 知らせ ${formatCountJa(summary.total, '件')}',
-            ),
-            const Text(
-              '同じ 人が 何回か 送ることも あります。人数は 目安です。',
-              style: KairanTextStyles.metaSecondary,
-            ),
+            if (showingPending)
+              InfoBox(
+                '返信は 保存済みです。近くの スマホと 交換できるときに、自動で 送ります。'
+                '元の 知らせが 期限切れのものも 含みます。今の 安否を 示す一覧では ありません。',
+                title: '自動送信待ち ${formatCountJa(sending, '件')}',
+              )
+            else ...[
+              InfoBox(
+                '${summary.line()}\nまだ 返事を していない: ${formatCountJa(summary.unacked, '件')}'
+                '\nこの一覧の 自動送信待ち: ${formatCountJa(sending, '件')}'
+                '\n近くの スマホで 保存を 確認: ${formatCountJa(handed, '件')}',
+                title: _showHistory
+                    ? '過去の 記録 ${formatCountJa(summary.total, '件')}'
+                    : '届いた 知らせ ${formatCountJa(summary.total, '件')}',
+              ),
+              const Text(
+                '同じ 人が 何回か 送ることも あります。人数は 目安です。',
+                style: KairanTextStyles.metaSecondary,
+              ),
+            ],
             SecondaryButton(
               label: _showHistory ? '現在の 知らせを 見る' : '過去の 記録を 見る',
               onPressed: () => setState(() {
                 _showHistory = !_showHistory;
+                if (showingPending) _filter = ReportFilter.all;
               }),
             ),
             const SectionTitle('しぼりこむ'),
@@ -238,14 +245,19 @@ class _ReportsScreenState extends State<ReportsScreen> {
                   ChoiceButton(
                     label: f.label,
                     selected: f == _filter,
-                    onPressed: () => setState(() => _filter = f),
+                    onPressed: () => setState(() {
+                      _filter = f;
+                      if (f == ReportFilter.sending) _showHistory = false;
+                    }),
                   ),
               ],
             ),
             const SizedBox(height: 12),
             if (all.isEmpty)
               InfoBox(
-                _showHistory
+                showingPending
+                    ? '自動送信待ちの 返信は ありません。'
+                    : _showHistory
                     ? '過去の 記録は ありません。'
                     : '住民からの 知らせは まだ 届いて いません。'
                           'グループの「住民からの 知らせを 受け付ける」が オンだと、住民が SOS・無事です・在宅避難・困っています を 送れます。'
@@ -280,13 +292,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
                         acked: e.acked,
                         historical: e.expired,
                         isReply: e.info.inReplyTo != null,
-                        stateLine: e.replyPending
-                            ? '返信を 広げる 準備が できていません。もう一度 返してください'
-                            : e.expired
-                            ? '期限切れの 過去の 記録'
-                            : e.ack == null
-                            ? 'まだ 返事を していません'
-                            : '受け取りました と 返しました（${formatDayTimeJa(dateTimeFromEpoch(e.ack!.envelope.createdAt), now: now)}）',
+                        stateLine: _replyState(e, now),
                         onTap: () => openReportDetail(context, _c, e.msgId),
                       ),
                     );
@@ -338,5 +344,24 @@ class _ReportsScreenState extends State<ReportsScreen> {
         },
       ),
     );
+  }
+
+  String _replyState(ReportEntry e, DateTime now) {
+    final ack = e.ack;
+    if (ack == null) {
+      return e.expired ? '期限切れの 過去の 記録' : 'まだ 返事を していません';
+    }
+    final prefix = e.expired ? '過去の 知らせへの 返信・' : '';
+    if (e.replyPending) return '$prefix保存済み・自動送信待ち';
+    final handedAt = e.replyHandedAt;
+    if (handedAt != null) {
+      return '$prefix近くの スマホで 保存を 確認'
+          '（${formatDayTimeJa(dateTimeFromEpoch(handedAt), now: now)}）';
+    }
+    if (ack.isLocal && ack.envelope.expiresAt < _c.now) {
+      return '$prefix返信の 期限切れ・受け渡し確認なし';
+    }
+    if (ack.isLocal) return '$prefix返信は 保存済み・受け渡し確認なし';
+    return '$prefixほかの 端末から 受け取りの 返信あり';
   }
 }

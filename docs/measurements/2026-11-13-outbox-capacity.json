@@ -1,0 +1,63 @@
+{
+  "kind": "local_file_benchmark_not_ble",
+  "date": "2026-11-13",
+  "change": "durable_reply_outbox",
+  "base_revision": "2c462981f3ea395c82cd0da7468d1e5e857b91a5",
+  "source_code": "same change set as this file",
+  "command": "flutter test --concurrency=1 --reporter expanded tool/benchmarks/report_capacity_test.dart",
+  "environment": "Mac arm64 / macOS 26.5 / Flutter 3.44.4 / Dart 3.12.2",
+  "notes": [
+    "FileStoreBackend writes to real temporary files. Radio and group settings are simulated.",
+    "Pending replies now mean local replies without persisted peer storage confirmation, including replies in the relay cache.",
+    "RSS includes the whole Flutter test process, VM, JIT and preceding test case. It is not phone app memory.",
+    "No BLE throughput or final-recipient arrival rate is measured."
+  ],
+  "results": [
+    {
+      "reports": 1000,
+      "receive_ms": 58.099,
+      "receive_max_event_gap_ms": 17.485,
+      "first_query_ms": 6.492,
+      "query_and_sos_p50_ms": 0.101,
+      "query_and_sos_p95_ms": 0.224,
+      "acknowledge_ms": 29.618,
+      "acknowledge_max_event_gap_ms": 11.641,
+      "reload_ms": 64.779,
+      "reload_max_event_gap_ms": 18.345,
+      "inbox_ingest_written_bytes": 414312,
+      "inbox_ingest_rewrites": 0,
+      "inbox_total_written_bytes": 1443008,
+      "inbox_total_rewritten_records": 1000,
+      "inbox_file_bytes": 689456,
+      "relay_count": 2001,
+      "pending_replies_after_ack": 1000,
+      "pending_replies_definition": "local_ack_without_peer_storage_confirmation",
+      "rss_before_reload_bytes": 295190528,
+      "rss_after_reload_bytes": 329203712,
+      "capacity_boundary_verified": false
+    },
+    {
+      "reports": 10000,
+      "receive_ms": 424.816,
+      "receive_max_event_gap_ms": 14.792,
+      "first_query_ms": 11.402,
+      "query_and_sos_p50_ms": 0.343,
+      "query_and_sos_p95_ms": 1.926,
+      "acknowledge_ms": 267.972,
+      "acknowledge_max_event_gap_ms": 12.317,
+      "reload_ms": 95.518,
+      "reload_max_event_gap_ms": 11.29,
+      "inbox_ingest_written_bytes": 4152900,
+      "inbox_ingest_rewrites": 0,
+      "inbox_total_written_bytes": 24822600,
+      "inbox_total_rewritten_records": 30000,
+      "inbox_file_bytes": 5953556,
+      "relay_count": 2901,
+      "pending_replies_after_ack": 10000,
+      "pending_replies_definition": "local_ack_without_peer_storage_confirmation",
+      "rss_before_reload_bytes": 522977280,
+      "rss_after_reload_bytes": 534233088,
+      "capacity_boundary_verified": true
+    }
+  ]
+}

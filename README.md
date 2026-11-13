@@ -32,6 +32,7 @@
 | [docs/11_bulk_data_reliability.md](docs/11_bulk_data_reliability.md) | 大量受信時の仕様: 本部の記録、SOS の保護、保存失敗・容量不足、受信の上限、旧版との互換性、確認テスト |
 | [docs/12_capacity_measurements.md](docs/12_capacity_measurements.md) | 本部記録 1 万件の実ファイル計測、保存・集計の改善、通信の再試行、残る制約と再実行方法 |
 | [docs/13_ble_encounter_estimates.md](docs/13_ble_encounter_estimates.md) | BLE の過去実測、片方が歩く場合の転送件数の試算、Bluetooth ON・画面オフで動く条件、未実施の実機確認 |
+| [docs/14_reply_outbox.md](docs/14_reply_outbox.md) | 1 万件の返信を自動で送り出す仕組み、近くの端末での保存確認、再起動・途中切断・保存失敗への対応 |
 
 ## ビルド
 

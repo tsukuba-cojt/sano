@@ -87,6 +87,7 @@ class ReportEntry {
     this.ack,
     this.expired = false,
     this.replyPending = false,
+    this.replyHandedAt,
   });
 
   final StoredMessage message;
@@ -96,7 +97,12 @@ class ReportEntry {
   /// 「受け取りました」。まだなら null。
   final StoredMessage? ack;
   final bool expired;
+
+  /// 返信を保存し、近くの端末の保存確認を待っている。
   final bool replyPending;
+
+  /// 近くの端末が返信を保存したことを確認した時刻。本人への到着ではない。
+  final int? replyHandedAt;
 
   int get msgId => message.msgId;
   int get groupId => message.groupId;
@@ -659,6 +665,8 @@ class AppController extends ChangeNotifier {
     _store.joinedGroupIds = _groups.codes;
     _store.officialGroupIds = _groups.officialCodes;
     _store.externallyStored = _inbox.containsMessageId;
+    _store.pendingOutgoing = () =>
+        _inbox.pendingReplies(now: _now(), canSee: canSeeReports);
     _store.beforeCommit = (staged, additions, now) =>
         _inbox.capture(staged, additions, now, canSee: canSeeReports);
     await _backfillInbox();
@@ -674,6 +682,7 @@ class AppController extends ChangeNotifier {
       createTimer: _createTimer,
       onSyncCompleted: _onSyncCompleted,
       onHanded: _onHanded,
+      onPeerStored: _onPeerStored,
     );
     node.setRelayMode(_settings.relayMode);
     _node = node;
@@ -781,6 +790,8 @@ class AppController extends ChangeNotifier {
     };
     if (!setEquals(reportGroups, _reportGroupIds)) {
       _reportGroupIds = reportGroups;
+      _store.notifyOutgoingChanged();
+      _node?.nudge();
       unawaited(_backfillInbox());
     }
     // 参加した直後に見えるようになったお知らせは「新着」ではなく既知にする
@@ -792,7 +803,21 @@ class AppController extends ChangeNotifier {
 
   void _onInboxChanged() {
     _invalidateReportViews();
+    // 中継枠から外れている返信も送信候補。保存や受渡し確認で候補が変わる
+    // ため、相手との前回同期時点の version 判定も更新する。
+    _store.notifyOutgoingChanged();
+    _node?.nudge();
     if (_initialized) notifyListeners();
+  }
+
+  void _onPeerStored(String peerHex, Set<int> ids, int at) {
+    // 一覧目録または STORED で確認した ID だけ。保存に失敗した場合は
+    // 未確認のまま残し、次の接触で同じ返信を再確認する。
+    unawaited(
+      _inbox.markRepliesHanded(ids, at: at).catchError((Object e) {
+        debugPrint('返信の受渡し確認の保存に失敗しました: $e');
+      }),
+    );
   }
 
   Future<void> _backfillInbox() async {
@@ -1998,9 +2023,8 @@ class AppController extends ChangeNotifier {
       );
       _reportContents[envelope] = content;
     }
-    final ack =
-        (canSeeReports(m.groupId) ? _inbox.get(m.msgId)?.ack : null) ??
-        _store.ackFor(m.msgId);
+    final record = canSeeReports(m.groupId) ? _inbox.get(m.msgId) : null;
+    final ack = record?.ack ?? _store.ackFor(m.msgId);
     return ReportEntry(
       message: m,
       body: content.body,
@@ -2009,8 +2033,12 @@ class AppController extends ChangeNotifier {
       replyPending:
           ack != null &&
           ack.isLocal &&
-          !_store.contains(ack.msgId) &&
+          record != null &&
+          record.ackHandedAt == null &&
+          record.retainUntil > now &&
+          !m.retracted &&
           ack.envelope.expiresAt >= now,
+      replyHandedAt: record?.ackHandedAt,
       expired: _store.localExpiresAt(m) < now,
     );
   }
@@ -2071,7 +2099,7 @@ class AppController extends ChangeNotifier {
       if (m.isLocal || m.retracted || m.isStub || m.isOpaque) continue;
       changesAt(_store.localExpiresAt(m) + 1);
       final ack = _inbox.get(m.msgId)?.ack ?? _store.ackFor(m.msgId);
-      if (ack != null && ack.isLocal && !_store.contains(ack.msgId)) {
+      if (ack != null && ack.isLocal) {
         changesAt(ack.envelope.expiresAt + 1);
       }
       sources.add(m);
@@ -2188,15 +2216,9 @@ class AppController extends ChangeNotifier {
       throw StateError('本部・スタッフの 端末だけが 返事を できます');
     }
     final existing = _inbox.get(msgId)?.ack ?? _store.ackFor(msgId);
-    if (existing != null) {
-      // inbox 保存後に中継ファイルだけ失敗した場合も、同じ返信を再試行する。
-      if (existing.isLocal &&
-          !_store.contains(existing.msgId) &&
-          existing.envelope.expiresAt >= _now()) {
-        return existing.envelope;
-      }
-      return null;
-    }
+    // 保存済みの返信は、本部の記録から自動送信する。中継ファイルだけが
+    // 失敗した場合も同じ ID が候補に残るので、再作成・再登録は不要。
+    if (existing != null) return null;
     final createdAt = _now();
     if (_store.localExpiresAt(target) < createdAt) {
       throw StateError('この 知らせは 期限が 切れています。新しい 知らせを 確かめてください');
@@ -2224,7 +2246,7 @@ class AppController extends ChangeNotifier {
   }) async {
     final ids = {
       for (final e in entries)
-        if ((!e.acked || e.replyPending) && !e.expired) e.msgId,
+        if (!e.acked && !e.expired) e.msgId,
     }.toList();
     var n = 0;
     onProgress?.call(0, ids.length);
@@ -2263,6 +2285,7 @@ class AppController extends ChangeNotifier {
   /// 知らせを文章にする（紙の台帳・無線で伝えるための写し）。
   String reportsAsText(List<ReportEntry> entries) {
     final lines = <String>[];
+    final now = _now();
     for (final e in entries) {
       final t = dateTimeFromEpoch(e.message.receivedAt);
       final parts = <String>[
@@ -2271,7 +2294,16 @@ class AppController extends ChangeNotifier {
         if (e.body.place.isNotEmpty) '場所: ${e.body.place}',
         if (e.body.text.trim().isNotEmpty) e.body.text.trim(),
         if (e.expired) '期限切れの 過去の 記録',
-        e.acked ? '受け取り済み' : 'まだ 返事を していない',
+        if (!e.acked)
+          'まだ 返事を していない'
+        else if (e.replyPending)
+          '返信を 保存済み（自動送信待ち）'
+        else if (e.replyHandedAt != null)
+          '近くの スマホが 返信を 保存（本人への 到着は 未確認）'
+        else if (e.ack!.isLocal && e.ack!.envelope.expiresAt < now)
+          '返信の 期限切れ（受け渡し確認なし）'
+        else
+          '受け取りの 返信あり（本人への 到着は 未確認）',
         '番号 ${bulletinNumber(e.msgId)}',
       ];
       lines.add(parts.join(' ／ '));

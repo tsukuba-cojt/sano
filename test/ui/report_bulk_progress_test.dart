@@ -105,27 +105,45 @@ void main() {
     backend.paused!.complete();
     await tester.pumpAndSettle();
     expect(c.receivedReports().every((e) => e.acked), isTrue);
+    expect(find.text('返信を 保存しました'), findsOneWidget);
+    expect(find.textContaining('保存した 返信: 250件'), findsOneWidget);
+    expect(find.textContaining('自動送信待ち: 250件'), findsNWidgets(2));
+    expect(find.textContaining('近くの スマホで 保存を 確認: 0件'), findsNWidgets(2));
+    await tester.tap(find.text('とじる'));
+    await tester.pumpAndSettle();
     expect(find.byType(LinearProgressIndicator), findsNothing);
-    expect(find.textContaining('250件の 返信を 保存しました'), findsOneWidget);
+    expect(find.byType(PrimaryButton), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('中継枠を超える一括返信は準備待ちを知らせ、未返信の絞り込みに残す', (tester) async {
+  testWidgets('中継枠を超える返信も全件保存成功と自動送信待ちを示し、返信ボタンを出さない', (tester) async {
     final c = await _showReports(tester, count: 3200);
     await _startAll(tester);
     final entries = c.receivedReports();
     final waiting = entries.where((e) => e.replyPending).length;
     expect(entries.every((e) => e.acked), isTrue);
-    expect(waiting, greaterThan(0));
-    expect(find.text('返信を 記録しました'), findsOneWidget);
-    expect(find.textContaining('返信の 記録: 3200件'), findsOneWidget);
-    expect(find.textContaining('準備待ちの 返信: $waiting件'), findsOneWidget);
-    expect(find.textContaining('相手への 到着を 確認した 件数では'), findsOneWidget);
+    expect(waiting, 3200);
+    expect(find.text('返信を 保存しました'), findsOneWidget);
+    expect(find.text('できませんでした'), findsNothing);
+    expect(find.textContaining('保存した 返信: 3200件'), findsOneWidget);
+    expect(find.textContaining('本人への 到着や 対応完了を 示すものでは'), findsOneWidget);
     await tester.tap(find.text('とじる'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('まだ 返事を していない'));
     await tester.pumpAndSettle();
-    expect(find.text('表示中の $waiting件に 受け取りましたと 返す'), findsOneWidget);
+    expect(find.text('この 条件の 知らせは ありません。'), findsOneWidget);
+    expect(find.byType(PrimaryButton), findsNothing);
+    await tester.tap(find.text('自動送信待ち'));
+    await tester.pumpAndSettle();
+    expect(find.text('自動送信待ち 3200件'), findsOneWidget);
+    expect(find.byType(PrimaryButton), findsNothing);
+    await c.reportInbox.markRepliesHanded([entries.first.ack!.msgId], at: kT0);
+    await tester.pumpAndSettle();
+    expect(find.text('自動送信待ち 3199件'), findsOneWidget);
+    await tester.tap(find.text('すべて'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('近くの スマホで 保存を 確認: 1件'), findsOneWidget);
+    expect(find.byType(PrimaryButton), findsNothing);
     expect(tester.takeException(), isNull);
   });
 }
