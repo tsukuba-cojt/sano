@@ -309,20 +309,14 @@ class SyncSession {
     return known;
   }
 
-  /// 途中で切れたセッションでも確かな「相手が持っているもの」（相手の目録 ∪
-  /// 相手から受け取ったもの。渡したものは届いたか分からないので含めない）。
-  Set<int> get knownByPeerConfirmed {
-    final known = <int>{..._peerHas, ..._confirmedSentIds, ..._receivedIds};
-    final filter = _peerFilter;
-    if (filter != null) {
-      for (final m in _store.all) {
-        if (filter.mightContain(m.msgId)) {
-          known.add(m.msgId);
-        }
-      }
-    }
-    return known;
-  }
+  /// 相手の一覧目録・保存確認・相手から受け取ったものだけを確定所持とする。
+  /// Bloom 要約の偽陽性を次回の先出し抑制へ持ち越すと、短い接触で SOS が
+  /// 届かなくなる。要約はそのセッションの通常送信の判定にだけ使う。
+  Set<int> get knownByPeerConfirmed => <int>{
+    ..._peerHas,
+    ..._confirmedSentIds,
+    ..._receivedIds,
+  };
 
   /// 相手が [msgId] を持っているか（目録の一覧、または要約での判定）。
   bool _peerMayHave(int msgId) =>
@@ -1107,7 +1101,9 @@ class SyncSession {
   Future<void> _shutdown({required bool sendBye}) async {
     if (sendBye && !_closeRequested) {
       try {
-        await _send(Frame.bye().encode());
+        // 既に失敗したリンクでは BYE も送信待ちになることがある。
+        // その応答でタイムアウトの後片付けと接続枠の解放を止めない。
+        _send(Frame.bye().encode()).ignore();
       } on Object catch (_) {
         // 送れなくても閉じる。
       }

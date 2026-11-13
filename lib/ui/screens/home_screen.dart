@@ -291,8 +291,7 @@ class _HomeScreenState extends State<HomeScreen> {
           final canPost = groups.any((g) => g.canPost);
           final canReport = _c.reportGroups.isNotEmpty;
           final seesReports = _c.seesAnyReports;
-          final reports = seesReports ? _c.receivedReports() : const <ReportEntry>[];
-          final reportSummary = AppController.summarize(reports);
+          final reportSummary = _c.receivedReportSummary();
           _triggerSosHaptics(reportSummary.unackedSos);
 
           return Column(

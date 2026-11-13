@@ -103,6 +103,21 @@ class ReportEntry {
   bool get acked => ack != null;
 }
 
+class _ReportContent {
+  const _ReportContent(this.body, this.info);
+
+  final NoticeBody body;
+  final ReportInfo info;
+}
+
+class _ReportView {
+  _ReportView(Iterable<ReportEntry> entries)
+    : entries = List.unmodifiable(entries);
+
+  final List<ReportEntry> entries;
+  late final ReportSummary summary = AppController.summarize(entries);
+}
+
 /// OS 通知の出し方（docs/08 C05）。
 enum NotificationLevel {
   /// すべて知らせる。
@@ -473,6 +488,15 @@ class AppController extends ChangeNotifier {
   final GroupManager _groups;
   Set<int> _reportGroupIds = {};
 
+  // 封筒は本文消去時に置き換わる。古い封筒を保持しない弱参照で解析を再利用する。
+  final Expando<_ReportContent> _reportContents = Expando('report contents');
+  List<StoredMessage>? _reportSources;
+  Set<int>? _reportViewGroupIds;
+  int? _reportViewsAt;
+  int? _reportViewsUntil;
+  final _reportViews =
+      <({int? groupCode, int? inReplyTo, bool includeExpired}), _ReportView>{};
+
   AppSettings _settings = AppSettings();
   MeshNode? _node;
   HandedLog _handed = HandedLog();
@@ -740,6 +764,7 @@ class AppController extends ChangeNotifier {
   }
 
   void _onStoreChanged() {
+    _invalidateReportViews();
     _syncGroupInfoFromStore();
     _checkNewNotices();
     _checkNewReports();
@@ -747,6 +772,7 @@ class AppController extends ChangeNotifier {
   }
 
   void _onGroupsChanged() {
+    _invalidateReportViews();
     _store.joinedGroupIds = _groups.codes;
     _store.officialGroupIds = _groups.officialCodes;
     final reportGroups = {
@@ -765,6 +791,7 @@ class AppController extends ChangeNotifier {
   }
 
   void _onInboxChanged() {
+    _invalidateReportViews();
     if (_initialized) notifyListeners();
   }
 
@@ -1939,38 +1966,157 @@ class AppController extends ChangeNotifier {
 
   /// 中継キャッシュから消えても、本部の受信記録から詳細を開ける。
   StoredMessage? reportMessage(int msgId) {
+    final now = _now();
     final record = _inbox.get(msgId);
     if (record != null &&
-        record.retainUntil > _now() &&
+        record.retainUntil > now &&
         canSeeReports(record.message.groupId)) {
       return record.message;
     }
-    return _store.get(msgId);
+    final relayed = _store.get(msgId);
+    if (relayed != null &&
+        relayed.kind == MessageKind.help &&
+        !relayed.isLocal &&
+        relayed.receivedAt + kReportInboxRetentionSeconds <= now) {
+      return null;
+    }
+    return relayed;
   }
 
   /// 知らせ 1 件を画面用にまとめる。kind=help で読めなければ null。
-  ReportEntry? reportEntryOf(StoredMessage m) {
-    final body = m.envelope.help;
-    if (body == null) {
-      return null;
+  ReportEntry? reportEntryOf(StoredMessage m) => _reportEntryAt(m, _now());
+
+  ReportEntry? _reportEntryAt(StoredMessage m, int now) {
+    final envelope = m.envelope;
+    var content = _reportContents[envelope];
+    if (content == null) {
+      final body = envelope.help;
+      if (body == null) return null;
+      content = _ReportContent(
+        body,
+        ReportInfo.decode(body.ext) ?? const ReportInfo(type: ReportType.need),
+      );
+      _reportContents[envelope] = content;
     }
     final ack =
         (canSeeReports(m.groupId) ? _inbox.get(m.msgId)?.ack : null) ??
         _store.ackFor(m.msgId);
     return ReportEntry(
       message: m,
-      body: body,
-      info:
-          ReportInfo.decode(body.ext) ??
-          const ReportInfo(type: ReportType.need),
+      body: content.body,
+      info: content.info,
       ack: ack,
       replyPending:
           ack != null &&
           ack.isLocal &&
           !_store.contains(ack.msgId) &&
-          ack.envelope.expiresAt >= _now(),
-      expired: _store.localExpiresAt(m) < _now(),
+          ack.envelope.expiresAt >= now,
+      expired: _store.localExpiresAt(m) < now,
     );
+  }
+
+  void _invalidateReportViews() {
+    _reportSources = null;
+    _reportViewGroupIds = null;
+    _reportViewsAt = null;
+    _reportViewsUntil = null;
+    _reportViews.clear();
+  }
+
+  /// 通信状態や絞り込みの変更だけでは、全件のマージ・ソートを繰り返さない。
+  /// 保存内容・閲覧権限の変更か、期限の境界を越えた時点で作り直す。
+  List<StoredMessage> _receivedReportSources(int now) {
+    final ids = <int>{
+      for (final g in _groups.groups)
+        if (g.canManage || g.isStaff) g.code,
+    };
+    final cached = _reportSources;
+    final until = _reportViewsUntil;
+    if (cached != null &&
+        setEquals(ids, _reportViewGroupIds) &&
+        now >= _reportViewsAt! &&
+        (until == null || now < until)) {
+      return cached;
+    }
+    _invalidateReportViews();
+    _reportViewGroupIds = ids;
+    _reportViewsAt = now;
+    void changesAt(int at) {
+      if (at > now && (_reportViewsUntil == null || at < _reportViewsUntil!)) {
+        _reportViewsUntil = at;
+      }
+    }
+
+    final messages = <int, StoredMessage>{};
+    // 昇格直後の移行中でも、既にディスクにある中継側の記録は読める。
+    if (ids.isNotEmpty) {
+      for (final m in _store.all) {
+        final retainUntil = m.receivedAt + kReportInboxRetentionSeconds;
+        if (m.kind == MessageKind.help &&
+            ids.contains(m.groupId) &&
+            retainUntil > now) {
+          messages[m.msgId] = m;
+          changesAt(retainUntil);
+        }
+      }
+      for (final r in _inbox.all) {
+        if (r.retainUntil > now && ids.contains(r.message.groupId)) {
+          messages[r.msgId] = r.message;
+          changesAt(r.retainUntil);
+        }
+      }
+    }
+    final sources = <StoredMessage>[];
+    for (final m in messages.values) {
+      if (m.isLocal || m.retracted || m.isStub || m.isOpaque) continue;
+      changesAt(_store.localExpiresAt(m) + 1);
+      final ack = _inbox.get(m.msgId)?.ack ?? _store.ackFor(m.msgId);
+      if (ack != null && ack.isLocal && !_store.contains(ack.msgId)) {
+        changesAt(ack.envelope.expiresAt + 1);
+      }
+      sources.add(m);
+    }
+    sources.sort((a, b) {
+      final time = b.receivedAt.compareTo(a.receivedAt);
+      return time != 0
+          ? time
+          : b.envelope.createdAt.compareTo(a.envelope.createdAt);
+    });
+    return _reportSources = sources;
+  }
+
+  _ReportView _receivedReportView({
+    int? groupCode,
+    int? inReplyTo,
+    bool includeExpired = false,
+  }) {
+    final now = _now();
+    final sources = _receivedReportSources(now);
+    final key = (
+      groupCode: groupCode,
+      inReplyTo: inReplyTo,
+      includeExpired: includeExpired,
+    );
+    final cached = _reportViews[key];
+    if (cached != null) return cached;
+    final entries = <ReportEntry>[];
+    for (final m in sources) {
+      // 期限切れだけの受信箱でも、現在の一覧のために全本文を読まない。
+      if ((groupCode != null && m.groupId != groupCode) ||
+          (!includeExpired && _store.localExpiresAt(m) < now)) {
+        continue;
+      }
+      final entry = _reportEntryAt(m, now);
+      if (entry != null &&
+          (inReplyTo == null || entry.info.inReplyTo == inReplyTo)) {
+        entries.add(entry);
+      }
+    }
+    final view = _ReportView(entries);
+    // 多数の安否確認を順に開いても、過去の絞り込み結果を保持し続けない。
+    if (_reportViews.length >= 8) _reportViews.remove(_reportViews.keys.first);
+    _reportViews[key] = view;
+    return view;
   }
 
   /// 本部・スタッフとして見られる知らせ（自分が送ったものは除く、新しい順）。
@@ -1979,53 +2125,22 @@ class AppController extends ChangeNotifier {
     int? groupCode,
     int? inReplyTo,
     bool includeExpired = false,
-  }) {
-    final ids = <int>{
-      for (final g in _groups.groups)
-        if ((g.canManage || g.isStaff) &&
-            (groupCode == null || g.code == groupCode))
-          g.code,
-    };
-    if (ids.isEmpty) return const [];
-    final now = _now();
-    // 昇格直後の移行中でも、既にディスクにある中継側の記録は読める。
-    final messages = <int, StoredMessage>{
-      for (final m in _store.all)
-        if (m.kind == MessageKind.help && ids.contains(m.groupId)) m.msgId: m,
-      for (final r in _inbox.all)
-        if (r.retainUntil > now && ids.contains(r.message.groupId))
-          r.msgId: r.message,
-    };
-    final out = <ReportEntry>[];
-    for (final m in messages.values) {
-      if (m.isLocal || m.retracted || m.isStub) continue;
-      final e = reportEntryOf(m);
-      if (e == null ||
-          (!includeExpired && e.expired) ||
-          (inReplyTo != null && e.info.inReplyTo != inReplyTo)) {
-        continue;
-      }
-      out.add(e);
-    }
-    out.sort((a, b) {
-      final time = b.message.receivedAt.compareTo(a.message.receivedAt);
-      return time != 0
-          ? time
-          : b.message.envelope.createdAt.compareTo(
-              a.message.envelope.createdAt,
-            );
-    });
-    return out;
-  }
+  }) => _receivedReportView(
+    groupCode: groupCode,
+    inReplyTo: inReplyTo,
+    includeExpired: includeExpired,
+  ).entries;
+
+  /// 一覧と同じ更新・期限の境界で集計も再利用する。
+  ReportSummary receivedReportSummary({int? groupCode, int? inReplyTo}) =>
+      _receivedReportView(groupCode: groupCode, inReplyTo: inReplyTo).summary;
 
   /// [entries] の集計。
   static ReportSummary summarize(Iterable<ReportEntry> entries) =>
       ReportSummary.of(entries.map((e) => (info: e.info, acked: e.acked)));
 
   /// まだ受け取りの返事をしていない SOS の件数（本部・スタッフの端末）。
-  int get unackedSosCount => receivedReports()
-      .where((e) => e.info.type == ReportType.sos && !e.acked)
-      .length;
+  int get unackedSosCount => receivedReportSummary().unackedSos;
 
   /// 自分が送った知らせ（期限内・取り消していないもの、新しい順）。
   /// [inReplyTo] で安否確認への返事に絞る。
@@ -2103,13 +2218,20 @@ class AppController extends ChangeNotifier {
   }
 
   /// 100 件ずつ保存・通知をまとめ、受信や画面操作に処理を戻す。
-  Future<int> acknowledgeAll(Iterable<ReportEntry> entries) async {
+  Future<int> acknowledgeAll(
+    Iterable<ReportEntry> entries, {
+    void Function(int completed, int total)? onProgress,
+  }) async {
     final ids = {
       for (final e in entries)
         if ((!e.acked || e.replyPending) && !e.expired) e.msgId,
     }.toList();
     var n = 0;
+    onProgress?.call(0, ids.length);
     for (var start = 0; start < ids.length; start += 100) {
+      // Future.value は microtask の連続になる。タイマーでイベントループへ
+      // 戻し、I/O が即完了する環境でも描画や入力を処理できるようにする。
+      await Future<void>.delayed(Duration.zero);
       final end = start + 100 < ids.length ? start + 100 : ids.length;
       final batch = <Envelope>[];
       for (final id in ids.sublist(start, end)) {
@@ -2120,8 +2242,7 @@ class AppController extends ChangeNotifier {
         n += await _store.addAll(batch, now: _now(), isLocal: true);
         _node?.nudge();
       }
-      // Widget テストの仮想タイマーを不要にしつつ I/O と通信を進める。
-      await Future<void>.value();
+      onProgress?.call(end, ids.length);
     }
     return n;
   }

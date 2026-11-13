@@ -85,6 +85,9 @@ class PeerRecord {
   /// 最後に同期が完了した時刻。
   int? lastSyncAt;
 
+  /// 重複リンクが動いている間に別の同期が成功したかを区別する。
+  int _completedSyncs = 0;
+
   /// この時刻までは接続しない（失敗バックオフ）。
   int backoffUntil = 0;
 
@@ -727,7 +730,9 @@ class MeshNode extends ChangeNotifier {
     _totalSessions++;
     _logLine('リンク確立 ${e.peerId} link=${e.linkId} '
         '${e.initiator ? 'central' : 'peripheral'} chunk=${e.maxChunk}');
-    unawaited(session.done.then((_) => _onSessionDone(session, p)));
+    final completedSyncsAtStart = p._completedSyncs;
+    unawaited(session.done.then((_) =>
+        _onSessionDone(session, p, completedSyncsAtStart)));
     unawaited(session.start());
     notifyListeners();
   }
@@ -797,7 +802,8 @@ class MeshNode extends ChangeNotifier {
     }
   }
 
-  void _onSessionDone(SyncSession session, PeerRecord p) {
+  void _onSessionDone(
+      SyncSession session, PeerRecord p, int completedSyncsAtStart) {
     _sessions.remove(session.linkId);
     final t = _now();
     final peerNode = session.peerNodeId;
@@ -832,11 +838,12 @@ class MeshNode extends ChangeNotifier {
     }
     if (hex != null) {
       final ids = session.succeeded
-          ? session.knownByPeer
+          ? session.knownByPeerConfirmed
           : <int>{...?_peerKnown[hex]?.ids, ...session.knownByPeerConfirmed};
       _peerKnown[hex] = (at: t, ids: ids);
     }
     if (session.succeeded) {
+      p._completedSyncs++;
       p.failures = 0;
       p.lastSyncAt = t;
       p.lastSeen = t;
@@ -868,16 +875,16 @@ class MeshNode extends ChangeNotifier {
         );
       }
     } else if (!_abortedByNode.remove(session)) {
-      // 同じ相手と別のセッションが進行中／直前に成功している場合は、
-      // 相手側が重複リンクを閉じただけなので失敗に数えない。
+      // 同じ相手の別のセッションが進行中、またはこのリンクの開始後に成功
+      // した場合は重複リンク扱い。前回の成功より後に始めた同期の保存失敗は
+      // 通常のバックオフにしないと、未保存分を即座に送り直し続けてしまう。
       final otherActive = hex != null &&
           _sessions.values.any((s) {
             final n = s.peerNodeId;
             return n != null && hexOf(n) == hex;
           });
-      final justSynced =
-          p.lastSyncAt != null && t - p.lastSyncAt! < resyncIntervalSeconds;
-      if (!otherActive && !justSynced) {
+      final supersededBySuccess = p._completedSyncs > completedSyncsAtStart;
+      if (!otherActive && !supersededBySuccess) {
         p.failures++;
         p.backoffUntil = t + failureBackoffSeconds;
       }

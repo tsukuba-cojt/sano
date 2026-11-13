@@ -28,6 +28,7 @@
 | [docs/08_use_cases.md](docs/08_use_cases.md) | ユースケース 74 件（誰が・いつ・何を、現行の ◯△✕）と v2 の仕様変更 C01〜C25（確定仕様・導入順・落とした案・変えないこと） |
 | [docs/10_test_spec.md](docs/10_test_spec.md) | 単体・結合・実機テストの仕様と実施記録 |
 | [docs/11_bulk_data_reliability.md](docs/11_bulk_data_reliability.md) | 大量受信時の仕様: 本部の記録、SOS の保護、保存失敗・容量不足、受信の上限、旧版との互換性、確認テスト |
+| [docs/12_capacity_measurements.md](docs/12_capacity_measurements.md) | 本部記録 1 万件の実ファイル計測、保存・集計の改善、通信の再試行、残る制約と再実行方法 |
 
 ## ビルド
 
@@ -47,6 +48,8 @@ Android SDK は `ANDROID_HOME` で指す（この環境では `/opt/homebrew/sha
 flutter analyze
 flutter test                         # ユニットテスト（封筒・圧縮・ストア・同期・UI）
 ```
+
+本部記録 1 万件の保存・集計・一括返信・再起動は、[負荷計測の手順](docs/12_capacity_measurements.md#5-再実行)でローカル実行できる。
 
 ### 実機なしで通信を試す
 

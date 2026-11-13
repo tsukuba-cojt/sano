@@ -37,7 +37,7 @@ enum ReportFilter {
       case ReportFilter.all:
         return true;
       case ReportFilter.unacked:
-        return !e.acked;
+        return !e.acked || e.replyPending;
       case ReportFilter.sos:
         return e.info.type == ReportType.sos;
       case ReportFilter.safe:
@@ -72,6 +72,8 @@ class _ReportsScreenState extends State<ReportsScreen> {
   ReportFilter _filter = ReportFilter.all;
   bool _busy = false;
   bool _showHistory = false;
+  int _completedReplies = 0;
+  int _totalReplies = 0;
 
   AppController get _c => widget.controller;
 
@@ -95,20 +97,54 @@ class _ReportsScreenState extends State<ReportsScreen> {
       title: 'まとめて 返事を しますか？',
       message:
           '表示中の ${formatCountJa(pending.length, '件')}に「受け取りました」を 返します。'
-          '送った 人の スマホに 届きます。対応の 約束では ありません。',
+          '近くの スマホを 通して 送るため、返信を 記録します。対応の 約束では ありません。',
       confirmLabel: '返事を する',
     );
     if (!ok || !mounted) {
       return;
     }
-    setState(() => _busy = true);
+    setState(() {
+      _busy = true;
+      _completedReplies = 0;
+      _totalReplies = pending.length;
+    });
     try {
-      final n = await _c.acknowledgeAll(pending);
+      await _c.acknowledgeAll(
+        pending,
+        onProgress: (completed, total) {
+          if (!mounted) return;
+          setState(() {
+            _completedReplies = completed;
+            _totalReplies = total;
+          });
+        },
+      );
       if (mounted) {
-        showSnack(
-          context,
-          '${formatCountJa(n, '件')}に 返事を しました。近くの スマホに 広がります。',
-        );
+        final ids = pending.map((e) => e.msgId).toSet();
+        final recorded = _c
+            .receivedReports(includeExpired: true)
+            .where((e) => ids.contains(e.msgId) && e.acked)
+            .toList();
+        final waiting = recorded.where((e) => e.replyPending).length;
+        final ready = recorded.length - waiting;
+        if (waiting > 0) {
+          await showMessageDialog(
+            context,
+            title: '返信を 記録しました',
+            message:
+                '返信の 記録: ${formatCountJa(recorded.length, '件')}\n'
+                '近くへ 広げる 準備が できた返信: ${formatCountJa(ready, '件')}\n'
+                '準備待ちの 返信: ${formatCountJa(waiting, '件')}\n\n'
+                '相手への 到着を 確認した 件数では ありません。'
+                '準備待ちは「まだ 返事を していない」から もう一度 試せます。',
+          );
+        } else {
+          showSnack(
+            context,
+            '${formatCountJa(recorded.length, '件')}の 返信を 保存しました。'
+            '近くの スマホと 交換すると 広がります。',
+          );
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -143,7 +179,12 @@ class _ReportsScreenState extends State<ReportsScreen> {
           final all = _showHistory
               ? received.where((e) => e.expired).toList()
               : received;
-          final summary = AppController.summarize(all);
+          final summary = _showHistory
+              ? AppController.summarize(all)
+              : _c.receivedReportSummary(
+                  groupCode: widget.groupCode,
+                  inReplyTo: widget.inReplyTo,
+                );
           final shown = all.where(_filter.matches).toList();
           final now = dateTimeFromEpoch(_c.now);
           final request = widget.inReplyTo == null
@@ -261,6 +302,20 @@ class _ReportsScreenState extends State<ReportsScreen> {
                       mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
+                        if (_busy) ...[
+                          Text(
+                            '返信を 記録しています '
+                            '$_completedReplies / ${formatCountJa(_totalReplies, '件')}',
+                            style: KairanTextStyles.meta,
+                          ),
+                          const SizedBox(height: 8),
+                          LinearProgressIndicator(
+                            value: _totalReplies == 0
+                                ? 0
+                                : _completedReplies / _totalReplies,
+                          ),
+                          const SizedBox(height: KairanSizes.gap),
+                        ],
                         if (unacked > 0) ...[
                           PrimaryButton(
                             label:
