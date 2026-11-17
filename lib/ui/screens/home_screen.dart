@@ -298,6 +298,8 @@ class _HomeScreenState extends State<HomeScreen> {
             children: [
               statusBar,
               if (storageError != null) _StorageErrorBand(storageError),
+              if (_c.notificationsBlocked && !settings.relayMode)
+                _NotificationBlockedBand(onTap: _c.allowNotifications),
               if (!settings.relayMode && urgentIds.isNotEmpty)
                 _UrgentBand(
                   count: urgentIds.length,
@@ -550,6 +552,40 @@ class _StorageErrorBand extends StatelessWidget {
           kind: InfoKind.danger,
         ),
       );
+}
+
+/// 通知を出す設定なのに OS の通知が許可されていないときの帯。押すと許可を聞く
+/// （一度断っていれば スマホの 設定を 開く）。
+class _NotificationBlockedBand extends StatelessWidget {
+  const _NotificationBlockedBand({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    const label = '通知が 許可されていません。新しい お知らせが 届いても 知らせが 出ません ▶ 許可する';
+    return Semantics(
+      button: true,
+      label: label,
+      onTap: onTap,
+      child: ExcludeSemantics(
+        child: Material(
+          color: KairanColors.selectedFill,
+          child: InkWell(
+            onTap: onTap,
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(
+                horizontal: KairanSizes.pagePadding,
+                vertical: 10,
+              ),
+              child: const Text(label, style: KairanTextStyles.meta),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// 固定枠・日付見出し付きのお知らせ一覧。

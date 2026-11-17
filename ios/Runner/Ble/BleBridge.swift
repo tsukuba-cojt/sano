@@ -219,6 +219,11 @@ final class BleBridge: NSObject, FlutterStreamHandler {
         result(granted)
       }
 
+    case "notificationsAllowed":
+      noticeNotifier.isAuthorized { allowed in
+        result(allowed)
+      }
+
     case "showNotice":
       guard let id = args["id"] as? Int, let title = args["title"] as? String else {
         result(FlutterError(code: "badArgs", message: "id または title がありません", details: nil))
