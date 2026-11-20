@@ -192,9 +192,8 @@ class InventorySelection {
 
 /// メッセージストア。
 ///
-/// [version] は「新しいメッセージが加わるたび」に +1 する（既読化・削除では
-/// 変えない）。再接続抑制の無効化判定（docs/02 §4）に使うため、相手に
-/// 渡せる内容が増えたときだけ動かす。
+/// [version] は中継内容の追加や、外部の送信待ちの変更で進む。
+/// 再接続抑制の無効化判定（docs/02 §4）に使う。
 class MessageStore extends ChangeNotifier {
   MessageStore(this._backend, {this.maxMessages = kDefaultMaxMessages});
 
@@ -225,6 +224,17 @@ class MessageStore extends ChangeNotifier {
   /// 中継枠から外れていても、専用受信箱で保存済みの ID。
   bool Function(int msgId)? externallyStored;
 
+  /// 別の永続領域にある、まだ相手へ渡せていないローカル返信。
+  /// 中継枠や目録の件数には含めず、送信候補へ合流させる。
+  Iterable<StoredMessage> Function()? pendingOutgoing;
+
+  /// 外部の送信待ちが保存・更新されたときに呼ぶ。保存中の作業コピーとは
+  /// 独立した版を使い、beforeCommit 内の通知も後の公開で巻き戻さない。
+  void notifyOutgoingChanged() {
+    _outgoingVersion++;
+    notifyListeners();
+  }
+
   bool isDurablyStored(int msgId) =>
       contains(msgId) || (externallyStored?.call(msgId) ?? false);
 
@@ -242,6 +252,7 @@ class MessageStore extends ChangeNotifier {
   Set<int> officialGroupIds = <int>{};
 
   int _version = 0;
+  int _outgoingVersion = 0;
   bool _loaded = false;
   int _opaqueCount = 0;
 
@@ -266,7 +277,7 @@ class MessageStore extends ChangeNotifier {
   }
 
   /// 内容が増えるたびに +1 される版数。
-  int get version => _version;
+  int get version => _version + _outgoingVersion;
 
   bool get isLoaded => _loaded;
 
@@ -958,12 +969,42 @@ class MessageStore extends ChangeNotifier {
 
   /// [ids] に無い、中継できるメッセージがあるか（同期し直す必要があるかの判定）。
   bool hasRelayableNotIn(Set<int> ids, {required int now}) {
-    for (final m in _messages.values) {
+    for (final m in _outgoingSnapshot(now).messages) {
       if (!ids.contains(m.msgId) && _isRelayable(m, now)) {
         return true;
       }
     }
     return false;
+  }
+
+  /// 1 回の候補選択中は外部 source を固定し、同じ ID を二重に送らない。
+  /// 中継側にもある ID は、取消・空殻を尊重しつつ発信元の原本を使う。
+  /// 中継して戻ったコピーの hop や残り時間で原本を送れなくしない。
+  ({List<StoredMessage> messages, Set<int> pendingIds}) _outgoingSnapshot(
+    int now,
+  ) {
+    final messages = Map<int, StoredMessage>.of(_messages);
+    final pendingIds = <int>{};
+    for (final m in pendingOutgoing?.call() ?? const <StoredMessage>[]) {
+      if (!m.isLocal ||
+          m.kind != MessageKind.ack ||
+          m.retracted ||
+          !_isRelayable(m, now)) {
+        continue;
+      }
+      final relay = _messages[m.msgId];
+      if (relay != null &&
+          (relay.retracted ||
+              relay.isStub ||
+              relay.supersededBy != null ||
+              relay.staleInfo)) {
+        messages.remove(m.msgId);
+        continue;
+      }
+      pendingIds.add(m.msgId);
+      messages[m.msgId] = m;
+    }
+    return (messages: messages.values.toList(), pendingIds: pendingIds);
   }
 
   /// 目録を選ぶ。[small]（maxChunk が小さい）なら受信時刻の新しい順に
@@ -1056,6 +1097,8 @@ class MessageStore extends ChangeNotifier {
   /// 「自分にあって相手にない」有効なメッセージを送信優先順で返す。
   ///
   /// [peerHas] は相手が持っているか（目録の集合か、要約の判定、v2.3）。
+  /// [peerHasConfirmed] があれば、未受渡し返信はこの正確な ID 確認だけで
+  /// 省略する。Bloom 一致で送信を止めると、保存確認を取り直せなくなる。
   /// 優先順: [sendTier]、[peerGroups] があればそのグループのもの、role 降順、
   /// created_at 降順。不透明メッセージは [peerRelaysUnknown] のときだけ、
   /// [cutoffCreatedAt] より古い notice は送らない（C08 C13）。[exclude] は先出し済み。
@@ -1066,9 +1109,15 @@ class MessageStore extends ChangeNotifier {
     int? cutoffCreatedAt,
     Set<int>? peerGroups,
     Set<int> exclude = const <int>{},
+    bool Function(int msgId)? peerHasConfirmed,
   }) {
-    final missing = _messages.values.where((m) {
-      if (exclude.contains(m.msgId) || peerHas(m.msgId)) {
+    final outgoing = _outgoingSnapshot(now);
+    final missing = outgoing.messages.where((m) {
+      final has =
+          outgoing.pendingIds.contains(m.msgId) && peerHasConfirmed != null
+          ? peerHasConfirmed(m.msgId)
+          : peerHas(m.msgId);
+      if (exclude.contains(m.msgId) || has) {
         return false;
       }
       if (!_isRelayable(m, now)) {
@@ -1093,6 +1142,12 @@ class MessageStore extends ChangeNotifier {
       if (k != 0) {
         return k;
       }
+      // 小さい返信が中継枠に何千件残っていても、未受渡し分を先に進める。
+      // SOS・緊急情報の段 0 は、引き続きすべての返信より先。
+      final pendingA = outgoing.pendingIds.contains(a.msgId) ? 0 : 1;
+      final pendingB = outgoing.pendingIds.contains(b.msgId) ? 0 : 1;
+      if (pendingA != pendingB) return pendingA.compareTo(pendingB);
+      if (pendingA == 0) return _oldestPendingFirst(a, b);
       if (peerGroups != null) {
         final ga = peerGroups.contains(a.groupId) ? 0 : 1;
         final gb = peerGroups.contains(b.groupId) ? 0 : 1;
@@ -1127,6 +1182,7 @@ class MessageStore extends ChangeNotifier {
     int maxCount = kPushMaxCount,
     Set<int> skip = const <int>{},
   }) {
+    final outgoing = _outgoingSnapshot(now);
     final since = now - kPushWindowSeconds;
     bool recent(StoredMessage m) =>
         (m.isLocal ? m.envelope.createdAt : m.receivedAt) >= since;
@@ -1137,7 +1193,7 @@ class MessageStore extends ChangeNotifier {
         !m.retracted;
     final acked = _ackedTargets();
     List<StoredMessage> pick(bool Function(StoredMessage m) test) =>
-        _messages.values.where((m) => ok(m) && test(m)).toList()
+        outgoing.messages.where((m) => ok(m) && test(m)).toList()
           ..sort(_newestFirst);
 
     final sos = pick(
@@ -1166,9 +1222,16 @@ class MessageStore extends ChangeNotifier {
       (m) =>
           m.kind == MessageKind.help && m.isLocal && !acked.contains(m.msgId),
     );
-    final acks = pick(
-      (m) => m.kind == MessageKind.ack && joinedGroupIds.contains(m.groupId),
-    );
+    final acks =
+        pick(
+          (m) =>
+              m.kind == MessageKind.ack && joinedGroupIds.contains(m.groupId),
+        )..sort((a, b) {
+          final pa = outgoing.pendingIds.contains(a.msgId) ? 0 : 1;
+          final pb = outgoing.pendingIds.contains(b.msgId) ? 0 : 1;
+          if (pa != pb) return pa.compareTo(pb);
+          return pa == 0 ? _oldestPendingFirst(a, b) : _newestFirst(a, b);
+        });
     final officials = pick(
       (m) =>
           m.kind == MessageKind.notice &&
@@ -1196,6 +1259,11 @@ class MessageStore extends ChangeNotifier {
       }
     }
     return out;
+  }
+
+  static int _oldestPendingFirst(StoredMessage a, StoredMessage b) {
+    final created = a.envelope.createdAt.compareTo(b.envelope.createdAt);
+    return created != 0 ? created : a.msgId.compareTo(b.msgId);
   }
 
   /// 表示対象の notice（期限内・未取消・未上書き）を新しい順に返す。

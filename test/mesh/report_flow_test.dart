@@ -310,7 +310,7 @@ void main() {
     );
     final text = hq.reportsAsText(hq.receivedReports(inReplyTo: request.msgId));
     expect(text.split('\n').length, 2);
-    expect(text, contains('受け取り済み'));
+    expect(text, contains('返信を 保存済み（自動送信待ち）'));
 
     // 書きなおしても「返事を 求める」は引き継ぐ。
     final rewritten = await hq.supersedeNotice(

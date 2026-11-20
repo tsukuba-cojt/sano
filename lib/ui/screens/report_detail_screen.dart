@@ -64,7 +64,7 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
 
   Future<void> _ack() => _run(
     () => _c.acknowledgeReport(widget.msgId),
-    done: '受け取りました と 返しました。近くの スマホを 通って 本人に 届きます。',
+    done: '返信を 保存しました。近くの スマホへ 自動で 送ります。',
   );
 
   Future<void> _retract() async {
@@ -119,7 +119,7 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
           final expires = dateTimeFromEpoch(_c.store.localExpiresAt(m));
 
           Widget? bottom;
-          if (manager && (ack == null || e.replyPending) && !e.expired) {
+          if (manager && ack == null && !e.expired) {
             bottom = PrimaryButton(
               label: '受け取りました と 返す',
               icon: Icons.check,
@@ -154,30 +154,53 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
                   '期限が 切れた 知らせの 記録です。今の 安否では ありません。新しい 知らせを 確かめてください。',
                   title: '過去の 記録',
                   kind: InfoKind.caution,
-                )
-              else if (e.replyPending)
+                ),
+              if (e.replyPending)
                 const InfoBox(
-                  '返信を 広げる 準備が できていません。空き容量を 確かめて、もう一度 返してください。',
+                  '返信は 保存済みです。近くの スマホと 交換できるときに、自動で 送ります。',
+                  title: '返信は 自動送信待ちです',
+                )
+              else if (e.replyHandedAt != null)
+                InfoBox(
+                  '${formatDayTimeJa(dateTimeFromEpoch(e.replyHandedAt!), now: now)}に '
+                  '近くの スマホが 返信を 保存しました。'
+                  '本人への 到着や 対応完了を 示すものでは ありません。',
+                  title: '近くの スマホへ 渡しました',
+                  kind: InfoKind.success,
+                )
+              else if (ack != null &&
+                  !mine &&
+                  ack.isLocal &&
+                  ack.envelope.expiresAt < _c.now)
+                const InfoBox(
+                  '近くの スマホが 返信を 保存した 確認は ありません。自動送信は 終了しました。',
+                  title: '返信の 期限が 切れました',
                   kind: InfoKind.caution,
+                )
+              else if (ack != null && !mine && ack.isLocal)
+                const InfoBox(
+                  '近くの スマホが 返信を 保存した 確認は ありません。',
+                  title: '返信は 保存済み・受け渡し確認なし',
                 )
               else if (ack != null)
                 InfoBox(
                   mine
                       ? '${_c.ackSenderLabel(ack)}が 受け取りました（${formatDayTimeJa(dateTimeFromEpoch(ack.envelope.createdAt), now: now)}）。'
                             '対応の 約束では ありません。急ぐ ときは 近所の 人にも 声を かけてください。'
-                      : '受け取りました と 返しました（${formatDayTimeJa(dateTimeFromEpoch(ack.envelope.createdAt), now: now)}）。',
+                      : 'ほかの 本部・スタッフの 端末から 受け取りの 返信を 受信しています。'
+                            '本人へ 届いたかは、この端末では 分かりません。',
                   kind: InfoKind.success,
                 )
-              else if (mine)
+              else if (mine && !e.expired)
                 const InfoBox(
                   'まだ 受け取りの 返事は ありません。近くの スマホを 通って 届くまで 時間が かかります。',
                   kind: InfoKind.caution,
                 )
-              else
+              else if (!e.expired)
                 InfoBox(
                   e.info.type == ReportType.sos
                       ? '助けを 求めて います。場所を 確かめて 係の 人を 向かわせ、「受け取りました」を 返してください。'
-                      : '「受け取りました」を 返すと、送った 人の スマホに 届きます。対応の 約束では ありません。',
+                      : '「受け取りました」を 返すと、返信を 保存し、近くの スマホへ 自動で 送ります。対応の 約束では ありません。',
                   kind: e.info.type == ReportType.sos
                       ? InfoKind.danger
                       : InfoKind.plain,

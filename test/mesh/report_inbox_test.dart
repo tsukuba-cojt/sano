@@ -145,7 +145,7 @@ void main() {
     c.dispose();
   });
 
-  test('返信の記録だけ保存できた場合、同じ返信を再送準備できる', () async {
+  test('返信の記録だけ保存できた場合も同じ返信を自動送信待ちに残す', () async {
     final relay = FailableBackend();
     final radio = FakeRadio(clock: FakeClock(startEpochSeconds: kT0));
     final c = AppController(
@@ -165,8 +165,15 @@ void main() {
     expect(c.store.contains(savedAck.msgId), isFalse);
     relay.fail = false;
     final retry = await c.acknowledgeReport(e.msgId);
-    expect(retry!.msgId, savedAck.msgId);
-    expect(c.store.contains(savedAck.msgId), isTrue);
+    expect(retry, isNull);
+    expect(c.store.contains(savedAck.msgId), isFalse);
+    expect(
+      c.reportInbox
+          .pendingReplies(now: kT0, canSee: c.canSeeReports)
+          .map((m) => m.msgId),
+      [savedAck.msgId],
+    );
+    expect(c.receivedReports().single.replyPending, isTrue);
     c.dispose();
   });
 

@@ -186,7 +186,8 @@ void main() {
     expect(find.text('山田 花子'), findsOneWidget);
     expect(find.text('〇〇町2丁目'), findsOneWidget);
     await _tap(tester, find.widgetWithText(ElevatedButton, '受け取りました と 返す'));
-    expect(find.textContaining('受け取りました と 返しました（'), findsOneWidget);
+    expect(find.text('返信は 自動送信待ちです'), findsOneWidget);
+    expect(find.widgetWithText(ElevatedButton, '受け取りました と 返す'), findsNothing);
     expect(hq.receivedReports().single.acked, isTrue);
     await tester.pump(const Duration(seconds: 5));
     await tester.pumpAndSettle();

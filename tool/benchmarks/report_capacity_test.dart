@@ -238,6 +238,8 @@ void main() {
             'inbox_file_bytes': await File(inbox.inner.path).length(),
             'relay_count': relayCount,
             'pending_replies_after_ack': pendingReplies,
+            'pending_replies_definition':
+                'local_ack_without_peer_storage_confirmation',
             'rss_before_reload_bytes': rssBeforeReload,
             'rss_after_reload_bytes': rssAfterReload,
             'capacity_boundary_verified': capacityBoundaryVerified,

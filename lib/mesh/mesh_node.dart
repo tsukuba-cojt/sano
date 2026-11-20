@@ -203,6 +203,7 @@ class MeshNode extends ChangeNotifier {
     this._sessionTimeout = kSessionTimeout,
     this.onSyncCompleted,
     this.onHanded,
+    this.onPeerStored,
   })  : nodeId = Uint8List.fromList(nodeId),
         _nodeIdHex = hexOf(nodeId),
         _now = now ?? nowEpochSeconds,
@@ -238,6 +239,11 @@ class MeshNode extends ChangeNotifier {
   /// （「この端末から 渡した 台数」用、C18）。
   final void Function(String peerNodeHex, List<int> sentIds, int epochSeconds)?
       onHanded;
+
+  /// 相手の保存を ID で確認できた分。途中切断でも既に届いた確認は有効。
+  /// 一覧目録・STORED・相手から受信した ID だけを渡し、Bloom は含めない。
+  final void Function(String peerNodeHex, Set<int> ids, int epochSeconds)?
+      onPeerStored;
 
   StreamSubscription<TransportEvent>? _subscription;
   final Map<String, PeerRecord> _peers = <String, PeerRecord>{};
@@ -837,17 +843,18 @@ class MeshNode extends ChangeNotifier {
       _lastSentAt = t;
     }
     if (hex != null) {
+      final confirmed = session.knownByPeerConfirmed;
       final previous = _peerKnown[hex]?.ids;
       // 成功したら確定所持で置き換えるが、前回までに確定したもので今回の
       // 目録にもまだあるものは引き継ぐ（なくすと、先出しのない交換を挟むたびに
       // 双方が持っている SOS などを毎回先出しし直す）。
       final ids = session.succeeded
-          ? <int>{
-              ...session.knownByPeerConfirmed,
-              ...session.stillHeldByPeer(previous),
-            }
-          : <int>{...?previous, ...session.knownByPeerConfirmed};
+          ? <int>{...confirmed, ...session.stillHeldByPeer(previous)}
+          : <int>{...?previous, ...confirmed};
       _peerKnown[hex] = (at: t, ids: ids);
+      if (confirmed.isNotEmpty) {
+        onPeerStored?.call(hex, Set.unmodifiable(confirmed), t);
+      }
     }
     if (session.succeeded) {
       p._completedSyncs++;

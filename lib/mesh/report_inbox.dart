@@ -21,10 +21,14 @@ const int _loadYieldRecords = 256;
 
 /// 報告と、その報告への最新の「受け取りました」を一緒に保管する。
 class InboxRecord {
-  const InboxRecord(this.message, {this.ack});
+  const InboxRecord(this.message, {this.ack, this.ackHandedAt});
 
   final StoredMessage message;
   final StoredMessage? ack;
+
+  /// この返信を近くの端末が保存したと確認した時刻。報告した本人への
+  /// 到着確認ではない。未確認、または返信がまだない場合は null。
+  final int? ackHandedAt;
 
   int get msgId => message.msgId;
   int get retainUntil => message.receivedAt + kReportInboxRetentionSeconds;
@@ -42,7 +46,7 @@ class ReportInbox extends ChangeNotifier {
   final int maxBytes;
   Map<int, InboxRecord> _records = {};
   Map<int, Uint8List> _encoded = {};
-  Set<int> _ackIds = {};
+  Map<int, int> _reportsByAckId = {};
   Future<void> _io = Future<void>.value();
   int _liveBytes = 0;
   int _journalBytes = 0;
@@ -54,7 +58,50 @@ class ReportInbox extends ChangeNotifier {
   Iterable<InboxRecord> get all => _records.values;
   InboxRecord? get(int id) => _records[id];
   bool containsMessageId(int id) =>
-      _records.containsKey(id) || _ackIds.contains(id);
+      _records.containsKey(id) || _reportsByAckId.containsKey(id);
+
+  /// 別の端末による保存をまだ確認していない、この端末の返信。
+  /// 返した一覧はスナップショットなので、送信中の保存で反復が壊れない。
+  Iterable<StoredMessage> pendingReplies({
+    required int now,
+    required bool Function(int groupId) canSee,
+  }) => [
+    for (final record in _records.values)
+      if (record.ackHandedAt == null &&
+          record.ack != null &&
+          record.ack!.isLocal &&
+          record.ack!.envelope.expiresAt >= now &&
+          !record.message.retracted &&
+          !record.message.isStub &&
+          record.retainUntil > now &&
+          canSee(record.message.groupId))
+        record.ack!,
+  ];
+
+  /// 近くの端末の保存確認を記録する。新しい返信へ置き換わった後に旧 ID
+  /// の確認が来ても、新しい返信を送信済みにはしない。
+  Future<void> markRepliesHanded(Iterable<int> ackIds, {required int at}) {
+    final ids = ackIds.toSet();
+    return _serialized(() async {
+      final changed = <int, InboxRecord>{};
+      for (final id in ids) {
+        final reportId = _reportsByAckId[id];
+        final record = reportId == null ? null : _records[reportId];
+        if (record == null ||
+            record.ack?.msgId != id ||
+            !record.ack!.isLocal ||
+            record.ackHandedAt != null) {
+          continue;
+        }
+        changed[record.msgId] = InboxRecord(
+          record.message,
+          ack: record.ack,
+          ackHandedAt: at,
+        );
+      }
+      await _save(changed, const {});
+    });
+  }
 
   Future<T> _serialized<T>(Future<T> Function() operation) {
     final next = _io.then((_) => operation());
@@ -98,9 +145,9 @@ class ReportInbox extends ChangeNotifier {
       }
       _records = loaded;
       _encoded = encoded;
-      _ackIds = {
+      _reportsByAckId = {
         for (final r in loaded.values)
-          if (r.ack != null) r.ack!.msgId,
+          if (r.ack != null) r.ack!.msgId: r.msgId,
       };
       _liveBytes = liveBytes;
       _journalBytes = journalBytes;
@@ -155,6 +202,9 @@ class ReportInbox extends ChangeNotifier {
       final candidate = InboxRecord(
         message,
         ack: _validAck(ack, message) ? ack : null,
+        ackHandedAt: current?.ack?.msgId == ack?.msgId
+            ? current?.ackHandedAt
+            : null,
       );
       if (!_same(current, candidate)) {
         changed[added.msgId] = candidate;
@@ -174,7 +224,13 @@ class ReportInbox extends ChangeNotifier {
       if (control.kind == MessageKind.ack && _validAck(control, old.message)) {
         final previous = old.ack;
         if (previous == null || _newer(control, previous)) {
-          replacement = InboxRecord(old.message, ack: control.copy());
+          replacement = InboxRecord(
+            old.message,
+            ack: control.copy(),
+            ackHandedAt: previous?.msgId == control.msgId
+                ? old.ackHandedAt
+                : null,
+          );
         }
       } else if (control.kind == MessageKind.tombstone &&
           control.envelope.role.code >= old.message.envelope.role.code &&
@@ -189,7 +245,11 @@ class ReportInbox extends ChangeNotifier {
           retracted: true,
           retractedByOfficial: control.envelope.role == SenderRole.official,
         );
-        replacement = InboxRecord(message, ack: old.ack);
+        replacement = InboxRecord(
+          message,
+          ack: old.ack,
+          ackHandedAt: old.ackHandedAt,
+        );
       }
       if (replacement != null) {
         changed[targetId] = replacement;
@@ -272,14 +332,14 @@ class ReportInbox extends ChangeNotifier {
         (id) => _records[id]?.retainUntil == _nextExpiry,
       );
       for (final id in removed) {
-        _ackIds.remove(_records.remove(id)?.ack?.msgId);
+        _reportsByAckId.remove(_records.remove(id)?.ack?.msgId);
         _encoded.remove(id);
       }
       for (final entry in changed.entries) {
-        _ackIds.remove(_records[entry.key]?.ack?.msgId);
+        _reportsByAckId.remove(_records[entry.key]?.ack?.msgId);
         _records[entry.key] = entry.value;
         final ack = entry.value.ack;
-        if (ack != null) _ackIds.add(ack.msgId);
+        if (ack != null) _reportsByAckId[ack.msgId] = entry.key;
         if (_nextExpiry == null || entry.value.retainUntil < _nextExpiry!) {
           _nextExpiry = entry.value.retainUntil;
         }
@@ -343,7 +403,8 @@ class ReportInbox extends ChangeNotifier {
       a != null &&
       a.message.retracted == b.message.retracted &&
       a.message.isStub == b.message.isStub &&
-      a.ack?.msgId == b.ack?.msgId;
+      a.ack?.msgId == b.ack?.msgId &&
+      a.ackHandedAt == b.ackHandedAt;
 
   static Map<String, Object?> _messageJson(StoredMessage m) => {
     'wire': base64Encode(m.wireBytes),
@@ -373,6 +434,7 @@ class ReportInbox extends ChangeNotifier {
         'v': 1,
         'message': _messageJson(r.message),
         if (r.ack != null) 'ack': _messageJson(r.ack!),
+        if (r.ackHandedAt != null) 'ackHandedAt': r.ackHandedAt,
       }),
     ),
   );
@@ -384,11 +446,13 @@ class ReportInbox extends ChangeNotifier {
     final ack = json['ack'] == null
         ? null
         : _messageFromJson(json['ack'] as Map<String, dynamic>);
+    final ackHandedAt = json['ackHandedAt'] as int?;
     if (message.kind != MessageKind.help ||
         message.isLocal ||
-        (ack != null && !_validAck(ack, message))) {
+        (ack != null && !_validAck(ack, message)) ||
+        (ackHandedAt != null && (ack == null || !ack.isLocal))) {
       throw const FormatException('本部の記録の形式が不正です');
     }
-    return InboxRecord(message, ack: ack);
+    return InboxRecord(message, ack: ack, ackHandedAt: ackHandedAt);
   }
 }

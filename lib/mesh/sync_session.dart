@@ -206,6 +206,7 @@ class SyncSession {
   int _bytesSent = 0;
   int _bytesReceived = 0;
   int _messageBytesSent = 0;
+  int _retainedMessageBytesSent = 0;
   int _opaqueBytesSent = 0;
   int _messagesSent = 0;
   int _messagesReceived = 0;
@@ -450,6 +451,8 @@ class SyncSession {
       final peer = _peerHello;
       final missing = _store.messagesMissingFrom(
         _peerMayHave,
+        peerHasConfirmed: (id) =>
+            _peerHas.contains(id) || _receivedIds.contains(id),
         now: _now(),
         peerRelaysUnknown: peer?.relaysUnknown ?? false,
         cutoffCreatedAt: _peerCutoff,
@@ -465,7 +468,7 @@ class SyncSession {
         final sent = _sendMessage(m);
         if (sent == _SendOutcome.budget) {
           _budgetExhausted = true;
-          _logLine('送信上限 $_byteBudget バイトに達したため打ち切り');
+          _logLine('送信上限（$_byteBudget バイト・保存待ちの件数/展開後サイズ）で打ち切り');
           break;
         }
         if (_outBuffered > maxChunk * 2) {
@@ -497,7 +500,11 @@ class SyncSession {
       localExpiresAt: _store.localExpiresAt(m),
     );
     final bytes = Frame.message(wire).encode();
-    if (_messageBytesSent + bytes.length > _byteBudget) {
+    final retainedBytes =
+        wire.length + (m.isOpaque ? 0 : m.envelope.bodyPlain.length) + 128;
+    if (_messageBytesSent + bytes.length > _byteBudget ||
+        _messagesSent >= kMaxPendingReceiveMessages ||
+        _retainedMessageBytesSent + retainedBytes > kMaxPendingReceiveBytes) {
       return _SendOutcome.budget;
     }
     if (m.isOpaque) {
@@ -508,6 +515,7 @@ class SyncSession {
     }
     _bufferSend(bytes);
     _messageBytesSent += bytes.length;
+    _retainedMessageBytesSent += retainedBytes;
     _messagesSent++;
     _sentIds.add(m.msgId);
     return _SendOutcome.sent;
@@ -531,16 +539,21 @@ class SyncSession {
         localExpiresAt: _store.localExpiresAt(m),
       );
       final frame = Frame.message(wire).encode();
+      final retainedBytes =
+          wire.length + (m.isOpaque ? 0 : m.envelope.bodyPlain.length) + 128;
       if (bytes + frame.length > kPushMaxBytes) {
         break;
       }
-      if (_messageBytesSent + frame.length > _byteBudget) {
+      if (_messageBytesSent + frame.length > _byteBudget ||
+          _messagesSent >= kMaxPendingReceiveMessages ||
+          _retainedMessageBytesSent + retainedBytes > kMaxPendingReceiveBytes) {
         break;
       }
       bytes += frame.length;
       _pushed.add(m.msgId);
       _bufferSend(frame);
       _messageBytesSent += frame.length;
+      _retainedMessageBytesSent += retainedBytes;
       _messagesSent++;
       _sentIds.add(m.msgId);
       if (_outBuffered > maxChunk * 2) {
