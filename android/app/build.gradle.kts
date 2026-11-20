@@ -19,7 +19,7 @@ android {
     defaultConfig {
         applicationId = "jp.kairanban.kairanban"
         // Android 8.0 (API 26) 以上をサポートする（docs/01_requirements.md N-1）。
-        minSdk = 26
+        minSdk = 24
         targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName

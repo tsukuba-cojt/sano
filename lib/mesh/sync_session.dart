@@ -196,6 +196,9 @@ class SyncSession {
   final Completer<void> _startCompleter = Completer<void>();
   final Completer<void> _peerInventoryEnd = Completer<void>();
 
+  /// 相手の目録（一覧または要約）を最後まで受け取ったか。
+  bool _peerInventoryReceived = false;
+
   SessionState _state = SessionState.hello;
   HelloInfo? _peerHello;
   int? _peerCutoff;
@@ -318,6 +321,16 @@ class SyncSession {
     ..._confirmedSentIds,
     ..._receivedIds,
   };
+
+  /// 以前に確定した所持 [previous] のうち、今回の相手の目録にもあるもの。
+  /// 一度確定したものなので、要約の偽陽性で新しく所持とみなすことにはならない。
+  /// 相手の目録を受け取っていなければ何も引き継がない。
+  Set<int> stillHeldByPeer(Set<int>? previous) {
+    if (previous == null || !_peerInventoryReceived) {
+      return const <int>{};
+    }
+    return previous.where(_peerMayHave).toSet();
+  }
 
   /// 相手が [msgId] を持っているか（目録の一覧、または要約での判定）。
   bool _peerMayHave(int msgId) =>
@@ -838,6 +851,7 @@ class SyncSession {
       return;
     }
     _state = SessionState.transfer;
+    _peerInventoryReceived = true;
     final filter = _peerFilter;
     _logLine(
       filter != null

@@ -54,6 +54,8 @@ object NoticeNotifier {
         hasPermission(context) && NotificationManagerCompat.from(context).areNotificationsEnabled()
 
     fun ensureChannel(context: Context) {
+        // 通知チャネルは Android 8.0 から。7.x は show() の優先度と音・振動の指定で扱う。
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         if (manager.getNotificationChannel(CHANNEL_ID) == null) {
             manager.createNotificationChannel(
@@ -195,6 +197,14 @@ object NoticeNotifier {
                 if (urgent) {
                     setVibrate(longArrayOf(0, 500, 300, 500, 300, 500))
                     setLights(Color.RED, 500, 500)
+                }
+                // Android 7.x にはチャネルがないので、音と振動を通知ごとに指定する
+                // （チャネルと同じく、夜間と「ふだん」は鳴らさない）。
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                    when (channelFor(importance)) {
+                        CHANNEL_ALERTS -> setDefaults(NotificationCompat.DEFAULT_SOUND)
+                        CHANNEL_ID -> setDefaults(NotificationCompat.DEFAULT_ALL)
+                    }
                 }
             }
             .build()

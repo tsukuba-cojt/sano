@@ -231,6 +231,7 @@ class BleBridge(private val appContext: Context) :
                     result.success(null)
                 }
                 "requestNotificationPermission" -> requestNotificationPermission(result)
+                "notificationsAllowed" -> result.success(NoticeNotifier.canNotify(appContext))
                 "showNotice" -> {
                     val id = call.argument<Number>("id")?.toInt()
                     val title = call.argument<String>("title")
@@ -467,7 +468,12 @@ class BleBridge(private val appContext: Context) :
             appContext.getSystemService(Vibrator::class.java)
         }
         try {
-            vibrator?.vibrate(VibrationEffect.createOneShot(150, VibrationEffect.DEFAULT_AMPLITUDE))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(VibrationEffect.createOneShot(150, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(150)
+            }
         } catch (e: RuntimeException) {
             Log.w(TAG, "振動できません", e)
         }

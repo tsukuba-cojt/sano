@@ -52,8 +52,17 @@ class FakePlatform extends NoopPlatformActions {
   @override
   Future<bool> requestNotificationPermission() async {
     notificationPermissionCalls++;
+    if (grantNotification) {
+      notificationsOn = true;
+    }
     return grantNotification;
   }
+
+  /// OS の通知の許可（[requestNotificationPermission] で許可されると true になる）。
+  bool notificationsOn = true;
+
+  @override
+  Future<bool> notificationsAllowed() async => notificationsOn;
 
   @override
   Future<void> showNotice({
@@ -403,6 +412,49 @@ void main() {
         ttl: const Duration(seconds: 10));
     await radio.elapse(const Duration(minutes: 1));
     expect(a.store.count, 1);
+  });
+
+  test('通知が許可されていなければホームで知らせ、許可されたら消える', () async {
+    final platform = FakePlatform()
+      ..notificationsOn = false
+      ..grantNotification = false;
+    final a = make('A', index: 1, platform: platform);
+    await a.init();
+    await Future<void>.delayed(Duration.zero);
+    expect(a.notificationsBlocked, isTrue);
+
+    // 一度断られていれば、OS の設定画面を開く。
+    await a.allowNotifications();
+    expect(platform.notificationPermissionCalls, 1);
+    expect(platform.settingsCalls, 1);
+    expect(a.notificationsBlocked, isTrue);
+
+    // 設定で許可して戻ってくると消える。
+    a.setForeground(false);
+    platform.notificationsOn = true;
+    a.setForeground(true);
+    await Future<void>.delayed(Duration.zero);
+    expect(a.notificationsBlocked, isFalse);
+
+    // 通知を出さない設定なら、許可がなくても知らせない。
+    platform.notificationsOn = false;
+    await a.refreshNotificationPermission();
+    expect(a.notificationsBlocked, isTrue);
+    await a.saveSettings(
+      a.settings.copy()..notificationLevel = NotificationLevel.off,
+    );
+    expect(a.notificationsBlocked, isFalse);
+  });
+
+  test('まだ聞いていなければ、ホームの帯から OS が許可を聞く', () async {
+    final platform = FakePlatform()..notificationsOn = false;
+    final a = make('A', index: 1, platform: platform);
+    await a.init();
+    await Future<void>.delayed(Duration.zero);
+    expect(a.notificationsBlocked, isTrue);
+    await a.allowNotifications();
+    expect(platform.settingsCalls, 0);
+    expect(a.notificationsBlocked, isFalse);
   });
 
   test('OS 操作は PlatformActions に委譲され、なければ既定値', () async {

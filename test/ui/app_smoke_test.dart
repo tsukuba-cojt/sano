@@ -42,8 +42,16 @@ class _FakePlatform extends NoopPlatformActions {
   @override
   Future<bool> requestNotificationPermission() async {
     notificationRequests++;
+    if (grantNotification) {
+      notificationsOn = true;
+    }
     return grantNotification;
   }
+
+  bool notificationsOn = true;
+
+  @override
+  Future<bool> notificationsAllowed() async => notificationsOn;
 
   @override
   Future<void> showNotice({
@@ -371,5 +379,34 @@ void main() {
     expect(find.text('1 / 5'), findsNothing);
     // 通信は 始めていないので 停止中の 帯が 出る。
     expect(find.text('交換が 止まっています'), findsOneWidget);
+  });
+
+  testWidgets('通知が 許可されていなければ ホームに 帯を 出し、押すと 許可を 聞く', (tester) async {
+    final clock = FakeClock(startEpochSeconds: 1000);
+    final radio = FakeRadio(clock: clock);
+    final platform = _FakePlatform()..notificationsOn = false;
+    final controller = AppController(
+      transport: radio.createTransport('ui-test-4'),
+      storeBackend: MemoryStoreBackend(),
+      kv: MemoryKeyValueStore(),
+      platform: platform,
+      now: clock.now,
+      createTimer: clock.createTimer,
+    );
+    await controller.init();
+    addTearDown(controller.dispose);
+    final s = controller.settings;
+    s.onboardingDone = true;
+    await controller.saveSettings(s);
+    await controller.createGroup(name: '〇〇町', membersCanPost: true);
+
+    await tester.pumpWidget(KairanApp(controller));
+    await tester.pumpAndSettle();
+    final band = find.textContaining('通知が 許可されていません');
+    expect(band, findsOneWidget);
+    await _tap(tester, band);
+    expect(platform.notificationRequests, 1);
+    expect(platform.settingsOpened, 0);
+    expect(band, findsNothing);
   });
 }

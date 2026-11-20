@@ -220,6 +220,23 @@ class BleTransport implements Transport {
     return granted ?? true;
   }
 
+  /// Dart 側の記録を OS のログ（subsystem jp.kairanban、category dart）へ流す（実機の調査用）。
+  void nativeLog(String line) {
+    _methods
+        .invokeMethod<Object?>('log', <String, Object?>{'message': line})
+        .then((_) {}, onError: (_) {});
+  }
+
+  /// OS の通知が許可されているか（許可を聞く前・断られた・OS 設定でオフなら false）。
+  /// 未対応環境は true。
+  Future<bool> notificationsAllowed() async {
+    final allowed = await _guard<bool?>(
+      'notificationsAllowed',
+      () => _methods.invokeMethod<bool>('notificationsAllowed'),
+    );
+    return allowed ?? true;
+  }
+
   /// 新しいお知らせを OS のローカル通知で知らせる。同じ [id] は置き換える。
   /// [id] は 31 ビットの非負整数（msg_id の下位 31 ビット）。
   /// [importance] は urgent / important / normal（docs/08 C05。チャネルと

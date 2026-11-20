@@ -38,6 +38,10 @@ const Duration kPurgeInterval = Duration(minutes: 1);
 /// 新しいお知らせを OS 通知にまとめるまでの待ち時間（連続受信を 1 件にまとめる）。
 const Duration kNoticeNotificationDebounce = Duration(seconds: 5);
 
+/// 同期の記録を OS のログにも流す（実機の調査用。
+/// `--dart-define=KAIRANBAN_NATIVE_LOG=true` で作った版だけ）。
+const bool kNativeMeshLog = bool.fromEnvironment('KAIRANBAN_NATIVE_LOG');
+
 /// 「終わりました」の既定有効期限（C01）。
 const Duration kEndNoticeTtl = Duration(hours: 12);
 
@@ -277,6 +281,9 @@ abstract class PlatformActions {
   /// OS の通知権限を要求する。許可済み・不要な環境では true。
   Future<bool> requestNotificationPermission();
 
+  /// OS の通知が許可されているか。許可を聞く前・断られたときは false。
+  Future<bool> notificationsAllowed();
+
   /// OS のローカル通知を出す。同じ [id] の通知は置き換える。
   Future<void> showNotice({
     required int id,
@@ -327,6 +334,9 @@ class NoopPlatformActions implements PlatformActions {
 
   @override
   Future<bool> requestNotificationPermission() async => true;
+
+  @override
+  Future<bool> notificationsAllowed() async => true;
 
   @override
   Future<void> showNotice({
@@ -382,6 +392,9 @@ class BleTransportActions implements PlatformActions {
   @override
   Future<bool> requestNotificationPermission() =>
       _ble.requestNotificationPermission();
+
+  @override
+  Future<bool> notificationsAllowed() => _ble.notificationsAllowed();
 
   @override
   Future<void> showNotice({
@@ -685,6 +698,10 @@ class AppController extends ChangeNotifier {
       onPeerStored: _onPeerStored,
     );
     node.setRelayMode(_settings.relayMode);
+    final transport = _transport;
+    if (kNativeMeshLog && transport is BleTransport) {
+      node.onLogLine = transport.nativeLog;
+    }
     _node = node;
 
     _store.addListener(_onStoreChanged);
@@ -702,6 +719,7 @@ class AppController extends ChangeNotifier {
     _syncGroupInfoFromStore();
     unawaited(refreshBattery());
     unawaited(_applyReminderSetting());
+    unawaited(refreshNotificationPermission());
     if (_settings.relayMode) {
       unawaited(_platform?.setKeepScreenOn(true));
     }
@@ -925,6 +943,7 @@ class AppController extends ChangeNotifier {
       unawaited(_persistSettings());
       // 開くたびに確認通知を先送りする（14 日以上開かない端末にだけ届く、C07）。
       unawaited(_applyReminderSetting());
+      unawaited(refreshNotificationPermission());
     } else if (_keepScreenOnUntil != null) {
       // 背面に行ったら「画面を 点けたままにする」は即解除する（C07）。
       unawaited(stopKeepScreenOn());
@@ -1663,8 +1682,46 @@ class AppController extends ChangeNotifier {
   Future<void> openAppSettings() async => _platform?.openAppSettings();
 
   /// OS の通知権限を要求する。許可済み・不要な環境では true。
-  Future<bool> requestNotificationPermission() async =>
-      await _platform?.requestNotificationPermission() ?? true;
+  Future<bool> requestNotificationPermission() async {
+    final granted = await _platform?.requestNotificationPermission() ?? true;
+    await refreshNotificationPermission();
+    return granted;
+  }
+
+  /// 通知を出す設定なのに、OS の通知が許可されていない（ホームで知らせる）。
+  /// 案内で「あとで」を選ぶと、住民は通知が出ないことに気づけないため。
+  bool get notificationsBlocked =>
+      _notificationsBlocked &&
+      _settings.notificationLevel != NotificationLevel.off;
+  bool _notificationsBlocked = false;
+
+  /// OS の通知の許可を確かめ直す（起動時と、前面に戻るたび）。
+  Future<void> refreshNotificationPermission() async {
+    final platform = _platform;
+    if (platform == null) {
+      return;
+    }
+    bool allowed;
+    try {
+      allowed = await platform.notificationsAllowed();
+    } on Object catch (e) {
+      debugPrint('通知の許可を確かめられません: $e');
+      return;
+    }
+    if (_notificationsBlocked != !allowed) {
+      _notificationsBlocked = !allowed;
+      notifyListeners();
+    }
+  }
+
+  /// ホームの「通知が 許可されていません」から。まだ聞いていなければ OS が聞き、
+  /// 一度断られていれば OS の設定画面を開く（戻ってきたら確かめ直す）。
+  Future<void> allowNotifications() async {
+    final granted = await requestNotificationPermission();
+    if (!granted) {
+      await openAppSettings();
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // 投稿
