@@ -70,6 +70,8 @@ class MeshService : Service() {
     }
 
     private fun createChannel() {
+        // 通知チャネルは Android 8.0 から。7.x は通知ごとの優先度で扱う。
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = getSystemService(NotificationManager::class.java) ?: return
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -89,7 +91,13 @@ class MeshService : Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val builder = Notification.Builder(this, CHANNEL_ID)
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this).setPriority(Notification.PRIORITY_LOW)
+        }
+        builder
             .setContentTitle(getString(R.string.mesh_notification_title))
             .setContentText(getString(R.string.mesh_notification_text))
             .setSmallIcon(R.drawable.ic_stat_kairanban)
@@ -116,7 +124,12 @@ class MeshService : Service() {
 
         /** 前景サービスとして開始する。既に動いていれば通知を更新するだけ。 */
         fun start(context: Context) {
-            context.startForegroundService(Intent(context, MeshService::class.java))
+            val intent = Intent(context, MeshService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
         }
 
         fun stop(context: Context) {
