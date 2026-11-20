@@ -38,6 +38,10 @@ const Duration kPurgeInterval = Duration(minutes: 1);
 /// 新しいお知らせを OS 通知にまとめるまでの待ち時間（連続受信を 1 件にまとめる）。
 const Duration kNoticeNotificationDebounce = Duration(seconds: 5);
 
+/// 同期の記録を OS のログにも流す（実機の調査用。
+/// `--dart-define=KAIRANBAN_NATIVE_LOG=true` で作った版だけ）。
+const bool kNativeMeshLog = bool.fromEnvironment('KAIRANBAN_NATIVE_LOG');
+
 /// 「終わりました」の既定有効期限（C01）。
 const Duration kEndNoticeTtl = Duration(hours: 12);
 
@@ -685,6 +689,10 @@ class AppController extends ChangeNotifier {
       onHanded: _onHanded,
     );
     node.setRelayMode(_settings.relayMode);
+    final transport = _transport;
+    if (kNativeMeshLog && transport is BleTransport) {
+      node.onLogLine = transport.nativeLog;
+    }
     _node = node;
 
     _store.addListener(_onStoreChanged);
