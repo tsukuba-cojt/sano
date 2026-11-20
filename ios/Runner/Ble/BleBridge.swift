@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreBluetooth
+import os
 #if os(macOS)
 import AppKit
 import FlutterMacOS
@@ -30,6 +31,7 @@ final class BleBridge: NSObject, FlutterStreamHandler {
   #endif
   /// 新しいお知らせのローカル通知。
   private let noticeNotifier = NoticeNotifier()
+  private let dartLogger = Logger(subsystem: "jp.kairanban", category: "dart")
   /// 画面点灯・交換完了の音・電池・読み上げ。
   private let device = DeviceActions()
   private let methodChannel: FlutterMethodChannel
@@ -213,6 +215,11 @@ final class BleBridge: NSObject, FlutterStreamHandler {
     case "requestBatteryOptimizationExemption":
       // iOS / macOS には該当する設定がない
       result(true)
+
+    case "log":
+      let message = args["message"] as? String ?? ""
+      dartLogger.info("\(message, privacy: .public)")
+      result(nil)
 
     case "requestNotificationPermission":
       noticeNotifier.requestPermission { granted in
