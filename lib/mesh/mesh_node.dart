@@ -837,9 +837,16 @@ class MeshNode extends ChangeNotifier {
       _lastSentAt = t;
     }
     if (hex != null) {
+      final previous = _peerKnown[hex]?.ids;
+      // 成功したら確定所持で置き換えるが、前回までに確定したもので今回の
+      // 目録にもまだあるものは引き継ぐ（なくすと、先出しのない交換を挟むたびに
+      // 双方が持っている SOS などを毎回先出しし直す）。
       final ids = session.succeeded
-          ? session.knownByPeerConfirmed
-          : <int>{...?_peerKnown[hex]?.ids, ...session.knownByPeerConfirmed};
+          ? <int>{
+              ...session.knownByPeerConfirmed,
+              ...session.stillHeldByPeer(previous),
+            }
+          : <int>{...?previous, ...session.knownByPeerConfirmed};
       _peerKnown[hex] = (at: t, ids: ids);
     }
     if (session.succeeded) {
@@ -920,11 +927,16 @@ class MeshNode extends ChangeNotifier {
     return a.length.compareTo(b.length);
   }
 
+  /// 記録の 1 行ごとに呼ぶ（実機の調査用。OS のログへ流す）。
+  void Function(String line)? onLogLine;
+
   void _logLine(String message) {
     final time = dateTimeFromEpoch(_now());
     String two(int v) => v.toString().padLeft(2, '0');
-    _log.addLast(
-        '${two(time.hour)}:${two(time.minute)}:${two(time.second)} $message');
+    final line =
+        '${two(time.hour)}:${two(time.minute)}:${two(time.second)} $message';
+    _log.addLast(line);
+    onLogLine?.call(line);
     while (_log.length > kRecentLogLines) {
       _log.removeFirst();
     }
