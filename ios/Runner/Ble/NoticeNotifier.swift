@@ -46,6 +46,20 @@ final class NoticeNotifier {
     }
   }
 
+  /// 通知を出せるか（許可済みなら true。まだ聞いていない・断られたなら false）。
+  func isAuthorized(_ completion: @escaping (Bool) -> Void) {
+    center.getNotificationSettings { settings in
+      let allowed: Bool
+      switch settings.authorizationStatus {
+      case .authorized, .provisional, .ephemeral:
+        allowed = true
+      default:
+        allowed = false
+      }
+      DispatchQueue.main.async { completion(allowed) }
+    }
+  }
+
   /// 午後 10 時〜午前 6 時か（important の音を止める時間帯）。
   private static func isQuietHours(_ date: Date = Date()) -> Bool {
     let hour = Calendar.current.component(.hour, from: date)

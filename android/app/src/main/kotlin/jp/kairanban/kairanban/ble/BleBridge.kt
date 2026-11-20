@@ -231,6 +231,7 @@ class BleBridge(private val appContext: Context) :
                     result.success(null)
                 }
                 "requestNotificationPermission" -> requestNotificationPermission(result)
+                "notificationsAllowed" -> result.success(NoticeNotifier.canNotify(appContext))
                 "showNotice" -> {
                     val id = call.argument<Number>("id")?.toInt()
                     val title = call.argument<String>("title")
