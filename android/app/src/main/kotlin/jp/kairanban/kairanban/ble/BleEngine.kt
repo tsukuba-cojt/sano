@@ -995,17 +995,22 @@ class BleEngine(context: Context, private val listener: Listener) {
     private fun openGatt(link: Link) {
         val device = link.device ?: return
         val gatt = try {
-            device.connectGatt(
-                appContext,
-                false,
-                clientCallback,
-                BluetoothDevice.TRANSPORT_LE,
-                BluetoothDevice.PHY_LE_1M_MASK,
-                // API 33 未満では、通知の値を共有の characteristic に書いてから handler へ
-                // 投げるため、続けて届いた通知で値が上書きされて取りこぼす。handler を渡さず
-                // Binder スレッドで受けてすぐ複製し、runOnEngine でエンジンのスレッドへ移す。
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) handler else null,
-            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                device.connectGatt(
+                    appContext,
+                    false,
+                    clientCallback,
+                    BluetoothDevice.TRANSPORT_LE,
+                    BluetoothDevice.PHY_LE_1M_MASK,
+                    // API 33 未満では、通知の値を共有の characteristic に書いてから handler へ
+                    // 投げるため、続けて届いた通知で値が上書きされて取りこぼす。handler を渡さず
+                    // Binder スレッドで受けてすぐ複製し、runOnEngine でエンジンのスレッドへ移す。
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) handler else null,
+                )
+            } else {
+                // Android 7.x: PHY と handler は指定できない（Binder スレッドで受ける、上と同じ扱い）。
+                device.connectGatt(appContext, false, clientCallback, BluetoothDevice.TRANSPORT_LE)
+            }
         } catch (e: RuntimeException) {
             Log.w(TAG, "connectGatt に失敗", e)
             null
