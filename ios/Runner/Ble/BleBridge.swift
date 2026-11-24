@@ -226,6 +226,24 @@ final class BleBridge: NSObject, FlutterStreamHandler {
         result(granted)
       }
 
+    case "backgroundWakeStatus":
+      #if os(iOS)
+      result((UIApplication.shared.delegate as? AppDelegate)?.beaconWake.status ?? "unavailable")
+      #else
+      result("unavailable")
+      #endif
+
+    case "enableBackgroundWake":
+      #if os(iOS)
+      guard let wake = (UIApplication.shared.delegate as? AppDelegate)?.beaconWake else {
+        result("unavailable")
+        return
+      }
+      wake.requestAlways { status in result(status) }
+      #else
+      result("unavailable")
+      #endif
+
     case "notificationsAllowed":
       noticeNotifier.isAuthorized { allowed in
         result(allowed)

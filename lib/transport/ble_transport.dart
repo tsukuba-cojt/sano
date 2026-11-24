@@ -227,6 +227,23 @@ class BleTransport implements Transport {
         .then((_) {}, onError: (_) {});
   }
 
+  /// iPhone の「アプリを 閉じても 受け取る」（iBeacon の領域監視）の状態。
+  /// always / whenInUse / denied / notDetermined / unavailable（iOS 以外）。
+  Future<String> backgroundWakeStatus() async =>
+      await _guard<String?>(
+        'backgroundWakeStatus',
+        () => _methods.invokeMethod<String>('backgroundWakeStatus'),
+      ) ??
+      'unavailable';
+
+  /// 位置情報の「常に」を求めて、「アプリを 閉じても 受け取る」を有効にする。終わった後の状態を返す。
+  Future<String> enableBackgroundWake() async =>
+      await _guard<String?>(
+        'enableBackgroundWake',
+        () => _methods.invokeMethod<String>('enableBackgroundWake'),
+      ) ??
+      'unavailable';
+
   /// OS の通知が許可されているか（許可を聞く前・断られた・OS 設定でオフなら false）。
   /// 未対応環境は true。
   Future<bool> notificationsAllowed() async {

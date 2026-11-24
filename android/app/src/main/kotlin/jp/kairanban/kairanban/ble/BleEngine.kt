@@ -465,6 +465,7 @@ class BleEngine(context: Context, private val listener: Listener) {
                 advertising = true
                 log("広告を開始しました")
                 publishState()
+                startBeacon()
             }
         }
 
@@ -517,7 +518,64 @@ class BleEngine(context: Context, private val listener: Listener) {
         }, ADVERTISE_RETRY_MS)
     }
 
+    // ---------------------------------------------------------------- iBeacon
+
+    /**
+     * 近くの iPhone を起こすための iBeacon（docs/02_protocol.md §1）。iOS は上に払って終了した
+     * アプリでも、iBeacon の領域に入ると起動し直す。接続しない別の広告として、本来の広告と並べて出す。
+     * 2 本目の広告に対応しない端末では出さない（本来の広告はそのまま）。
+     */
+    private var beaconRequested = false
+
+    private val beaconCallback = object : AdvertiseCallback() {
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+            handler.post { log("iBeacon を開始しました") }
+        }
+
+        override fun onStartFailure(errorCode: Int) {
+            handler.post {
+                beaconRequested = false
+                log("iBeacon の開始に失敗しました (${advertiseErrorName(errorCode)})")
+            }
+        }
+    }
+
+    private fun startBeacon() {
+        if (beaconRequested || !running || !poweredOn) return
+        val bt = adapter ?: return
+        if (!bt.isMultipleAdvertisementSupported) return
+        val advertiser = bt.bluetoothLeAdvertiser ?: return
+        val settings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+            .setConnectable(false)
+            .setTimeout(0)
+            .build()
+        val data = AdvertiseData.Builder()
+            .addManufacturerData(APPLE_COMPANY_ID, iBeaconPayload())
+            .setIncludeDeviceName(false)
+            .setIncludeTxPowerLevel(false)
+            .build()
+        try {
+            advertiser.startAdvertising(settings, data, beaconCallback)
+            beaconRequested = true
+        } catch (e: RuntimeException) {
+            log("iBeacon の開始に失敗: ${e.message}")
+        }
+    }
+
+    private fun stopBeacon() {
+        if (!beaconRequested) return
+        beaconRequested = false
+        try {
+            adapter?.bluetoothLeAdvertiser?.stopAdvertising(beaconCallback)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "iBeacon の停止に失敗", e)
+        }
+    }
+
     private fun stopAdvertising() {
+        stopBeacon()
         if (!advertising && !advertiseRequested) return
         advertising = false
         advertiseRequested = false
@@ -1498,6 +1556,19 @@ class BleEngine(context: Context, private val listener: Listener) {
         private const val SCAN_QUOTA_COUNT = 5
         private const val SCAN_RETRY_MS = 30_000L
         private const val ADVERTISE_RETRY_MS = 30_000L
+
+        /** 回覧板の iBeacon UUID（docs/02_protocol.md §1）。製造者 ID は上の APPLE_COMPANY_ID。 */
+        private val BEACON_UUID: UUID = UUID.fromString("D6F98894-6EFB-4826-8E17-F7DD7152327A")
+
+        /** iBeacon の中身: 0x02 0x15、UUID 16 バイト、major 0、minor 0、1 m での強さ -59 dBm。 */
+        fun iBeaconPayload(): ByteArray {
+            val out = java.nio.ByteBuffer.allocate(23)
+            out.put(0x02).put(0x15)
+            out.putLong(BEACON_UUID.mostSignificantBits).putLong(BEACON_UUID.leastSignificantBits)
+            out.putShort(0).putShort(0)
+            out.put((-59).toByte())
+            return out.array()
+        }
         private const val SERVER_RETRY_MS = 5_000L
         private const val DISCOVER_DEDUP_MS = 2_000L
         private const val DEVICE_CACHE_TTL_MS = 5 * 60_000L

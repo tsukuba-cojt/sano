@@ -16,8 +16,10 @@ v2 は [08_use_cases.md](08_use_cases.md) の仕様変更 C01〜C25 のうち、
 | TX Characteristic（peripheral → central、Notify） | `6b616972-616e-4b41-4952-414e00000012` |
 | エポック（created_at / expires_at の起点） | 2026-01-01T00:00:00Z = Unix 1767225600 |
 | プロトコルバージョン | 1（当面 1 のまま送る。受信側は不一致でも切らない。能力は HELLO の caps で伝える）（v2: C13） |
+| iBeacon UUID（iPhone を起こす合図） | `D6F98894-6EFB-4826-8E17-F7DD7152327A`（major 0、minor 0、1 m の強さ -59 dBm） |
 
 - 広告には **Service UUID のみ** を載せる（Local Name なし、Manufacturer Data なし）。iOS はバックグラウンドで UUID が overflow area に移るため、Android スキャナは Apple 製造者データ（Company ID 0x004C、先頭バイト 0x01）も候補として扱い、接続後にサービス探索で確認する。
+- Android は本来の広告と並べて、接続しない **iBeacon**（上の UUID）も出す（2 本目の広告に対応する端末だけ）。iPhone は位置情報が「常に」なら iBeacon の領域を監視し、利用者が上に払って終了していても、領域に入ると iOS がアプリを背面で起動し直す（Core Bluetooth の出来事では起こされない）。起きたアプリは画面なしのエンジンで同期を始める。iPhone・Mac は iBeacon を出さない（背面の iPhone は出せず、Core Bluetooth の広告と同時に出せないため）。
 - 全 characteristic / 接続は平文（暗号化・ペアリング要求なし）。
 - ノード ID: 端末ごとに生成した 8 バイト乱数（永続）。
 

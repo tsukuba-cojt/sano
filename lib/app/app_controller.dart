@@ -271,6 +271,32 @@ class AppSettings {
   }
 }
 
+/// iPhone の「アプリを 閉じても 受け取る」（iBeacon の領域監視、docs/02_protocol.md §1）の状態。
+enum BackgroundWake {
+  /// 位置情報が「常に」。上に払って終了しても、近くの Android が来ると起き直す。
+  on,
+
+  /// 「使用中のみ」。「常に」に変える必要がある。
+  needsAlways,
+
+  /// 断られた。スマホの設定で変える。
+  denied,
+
+  /// まだ聞いていない。
+  notAsked,
+
+  /// iPhone 以外（Android は常駐サービスで足りる）。
+  unavailable;
+
+  static BackgroundWake parse(String status) => switch (status) {
+        'always' => on,
+        'whenInUse' => needsAlways,
+        'denied' => denied,
+        'notDetermined' => notAsked,
+        _ => unavailable,
+      };
+}
+
 /// OS 側の操作（権限要求・OS 通知など）。トランスポートの契約には含まれないため
 /// 別に注入する。null なら何もしない。
 abstract class PlatformActions {
@@ -283,6 +309,12 @@ abstract class PlatformActions {
 
   /// OS の通知が許可されているか。許可を聞く前・断られたときは false。
   Future<bool> notificationsAllowed();
+
+  /// iPhone の「アプリを 閉じても 受け取る」の状態（[BackgroundWake]）。
+  Future<BackgroundWake> backgroundWakeStatus();
+
+  /// 位置情報の「常に」を求める。終わった後の状態を返す。
+  Future<BackgroundWake> enableBackgroundWake();
 
   /// OS のローカル通知を出す。同じ [id] の通知は置き換える。
   Future<void> showNotice({
@@ -337,6 +369,14 @@ class NoopPlatformActions implements PlatformActions {
 
   @override
   Future<bool> notificationsAllowed() async => true;
+
+  @override
+  Future<BackgroundWake> backgroundWakeStatus() async =>
+      BackgroundWake.unavailable;
+
+  @override
+  Future<BackgroundWake> enableBackgroundWake() async =>
+      BackgroundWake.unavailable;
 
   @override
   Future<void> showNotice({
@@ -395,6 +435,14 @@ class BleTransportActions implements PlatformActions {
 
   @override
   Future<bool> notificationsAllowed() => _ble.notificationsAllowed();
+
+  @override
+  Future<BackgroundWake> backgroundWakeStatus() async =>
+      BackgroundWake.parse(await _ble.backgroundWakeStatus());
+
+  @override
+  Future<BackgroundWake> enableBackgroundWake() async =>
+      BackgroundWake.parse(await _ble.enableBackgroundWake());
 
   @override
   Future<void> showNotice({
@@ -720,6 +768,7 @@ class AppController extends ChangeNotifier {
     unawaited(refreshBattery());
     unawaited(_applyReminderSetting());
     unawaited(refreshNotificationPermission());
+    unawaited(refreshBackgroundWake());
     if (_settings.relayMode) {
       unawaited(_platform?.setKeepScreenOn(true));
     }
@@ -944,6 +993,7 @@ class AppController extends ChangeNotifier {
       // 開くたびに確認通知を先送りする（14 日以上開かない端末にだけ届く、C07）。
       unawaited(_applyReminderSetting());
       unawaited(refreshNotificationPermission());
+      unawaited(refreshBackgroundWake());
     } else if (_keepScreenOnUntil != null) {
       // 背面に行ったら「画面を 点けたままにする」は即解除する（C07）。
       unawaited(stopKeepScreenOn());
@@ -1712,6 +1762,41 @@ class AppController extends ChangeNotifier {
       _notificationsBlocked = !allowed;
       notifyListeners();
     }
+  }
+
+  /// iPhone の「アプリを 閉じても 受け取る」の状態。起動時と前面に戻るたびに確かめ直す。
+  BackgroundWake get backgroundWake => _backgroundWake;
+  BackgroundWake _backgroundWake = BackgroundWake.unavailable;
+
+  Future<void> refreshBackgroundWake() async {
+    final platform = _platform;
+    if (platform == null) {
+      return;
+    }
+    BackgroundWake status;
+    try {
+      status = await platform.backgroundWakeStatus();
+    } on Object catch (e) {
+      debugPrint('「閉じても 受け取る」の状態を確かめられません: $e');
+      return;
+    }
+    if (status != _backgroundWake) {
+      _backgroundWake = status;
+      notifyListeners();
+    }
+  }
+
+  /// 設定の「アプリを 閉じても 受け取る」から。まだ聞いていなければ OS が聞く。
+  /// 「使用中のみ」や断られたときは、画面が スマホの 設定を 開く 案内を出す。
+  Future<BackgroundWake> enableBackgroundWake() async {
+    final platform = _platform;
+    if (platform == null) {
+      return BackgroundWake.unavailable;
+    }
+    final status = await platform.enableBackgroundWake();
+    _backgroundWake = status;
+    notifyListeners();
+    return status;
   }
 
   /// ホームの「通知が 許可されていません」から。まだ聞いていなければ OS が聞き、

@@ -235,6 +235,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
     });
   }
 
+  Future<void> _enableBackgroundWake() {
+    return _run(() async {
+      final status = await _c.enableBackgroundWake();
+      if (!mounted) {
+        return;
+      }
+      showSnack(
+        context,
+        status == BackgroundWake.on
+            ? 'アプリを 閉じても 受け取れるように なりました。'
+            : '位置情報を「常に」に すると 使えます。スマホの 設定で 変えられます。',
+      );
+    });
+  }
+
   Future<void> _requestBatteryExemption() {
     return _run(() async {
       final ok = await _c.requestBatteryExemption();
@@ -462,6 +477,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   onPressed: _busy ? null : _openAppSettings,
                 ),
               ],
+              if (_c.backgroundWake != BackgroundWake.unavailable) ...[
+                const SizedBox(height: 12),
+                _BackgroundWakeBox(
+                  status: _c.backgroundWake,
+                  busy: _busy,
+                  onEnable: _enableBackgroundWake,
+                  onOpenSettings: _openAppSettings,
+                ),
+              ],
               if (_isAndroid) ...[
                 const SizedBox(height: 12),
                 const Text(
@@ -595,6 +619,60 @@ class _Bullet extends StatelessWidget {
           Expanded(child: Text(text, style: KairanTextStyles.body)),
         ],
       ),
+    );
+  }
+}
+
+/// iPhone の「アプリを 閉じても 受け取る」（iBeacon の領域監視）。
+class _BackgroundWakeBox extends StatelessWidget {
+  const _BackgroundWakeBox({
+    required this.status,
+    required this.busy,
+    required this.onEnable,
+    required this.onOpenSettings,
+  });
+
+  final BackgroundWake status;
+  final bool busy;
+  final VoidCallback onEnable;
+  final VoidCallback onOpenSettings;
+
+  @override
+  Widget build(BuildContext context) {
+    final on = status == BackgroundWake.on;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          on ? 'アプリを 閉じても 受け取る: オン' : 'アプリを 閉じても 受け取る: オフ',
+          style: KairanTextStyles.sectionTitle,
+        ),
+        const SizedBox(height: 4),
+        const Text(
+          'アプリを 上に スワイプして 閉じても、近くに Android の 回覧板が 来ると 起きて 受け取ります。'
+          '位置情報を「常に」に する 必要が あります。場所は 記録も 送信も しません。',
+          style: KairanTextStyles.meta,
+        ),
+        if (!on) ...[
+          const SizedBox(height: 8),
+          if (status == BackgroundWake.notAsked)
+            SecondaryButton(
+              label: 'アプリを 閉じても 受け取る',
+              onPressed: busy ? null : onEnable,
+            )
+          else ...[
+            const Text(
+              'スマホの 設定 →「回覧板」→「位置情報」で「常に」を 選んでください。',
+              style: KairanTextStyles.meta,
+            ),
+            const SizedBox(height: 8),
+            SecondaryButton(
+              label: 'スマホの 設定を 開く',
+              onPressed: busy ? null : onOpenSettings,
+            ),
+          ],
+        ],
+      ],
     );
   }
 }
