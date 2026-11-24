@@ -5,6 +5,7 @@ let kMaxAttributeLength = 512
 import Foundation
 import os
 #if os(iOS)
+import ActivityKit
 import UIKit
 #endif
 
@@ -120,6 +121,10 @@ final class BleEngine: NSObject {
   private var dutyTimer: DispatchSourceTimer?
   private var dutyTick = 0
   private var inForeground = true
+  /// 背面でも Live Activity が出ている。iOS 26 以降は、画面が点いている間（ロック画面を含む）
+  /// 前面と同じ条件でスキャンでき、背面の iPhone の広告（overflow 領域）も拾える。
+  /// 画面が消えると OS が制限する（Apple によれば回避策なし）。
+  private var liveActivityInUse = false
   private static let dutyTickSeconds: TimeInterval = 20
 
   private var scanning = false
@@ -269,11 +274,23 @@ final class BleEngine: NSObject {
   }
 
   @objc private func appWillResignActive() {
+    let inUse = BleEngine.liveActivityShown
     queue.async {
       self.inForeground = false
+      self.liveActivityInUse = inUse
       self.updateDutyCycle()
       self.restartScan(reason: "背面")
     }
+  }
+  #endif
+
+  #if os(iOS)
+  /// 回覧板の Live Activity が出ているか（メインスレッドで読む）。
+  private static var liveActivityShown: Bool {
+    if #available(iOS 16.1, *) {
+      return Activity<KairanActivityAttributes>.activities.contains { $0.activityState == .active }
+    }
+    return false
   }
   #endif
 
@@ -602,10 +619,11 @@ final class BleEngine: NSObject {
     let shouldScan = running && central.state == .poweredOn && !scanPaused
     if shouldScan && !scanning {
       // 前面では同じ相手を繰り返し知らせる（間引きは didDiscover の 2 秒）。背面では OS が
-      // 重複を落とすので false（かけ直しは refreshScanIfStale）。
+      // 重複を落とすので false（かけ直しは refreshScanIfStale）。ただし Live Activity が
+      // 出ていれば iOS 26 以降は画面点灯中に前面と同じに扱われるので true のまま。
       central.scanForPeripherals(
         withServices: [serviceUUID],
-        options: [CBCentralManagerScanOptionAllowDuplicatesKey: inForeground])
+        options: [CBCentralManagerScanOptionAllowDuplicatesKey: inForeground || liveActivityInUse])
       scanning = true
       lastScanStart = Date()
       log("scan: 開始")
