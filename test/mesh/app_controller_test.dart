@@ -64,6 +64,20 @@ class FakePlatform extends NoopPlatformActions {
   @override
   Future<bool> notificationsAllowed() async => notificationsOn;
 
+  /// iPhone の「アプリを 閉じても 受け取る」。[enableBackgroundWake] で [wakeAfterAsk] になる。
+  BackgroundWake wake = BackgroundWake.unavailable;
+  BackgroundWake wakeAfterAsk = BackgroundWake.on;
+  int wakeRequests = 0;
+
+  @override
+  Future<BackgroundWake> backgroundWakeStatus() async => wake;
+
+  @override
+  Future<BackgroundWake> enableBackgroundWake() async {
+    wakeRequests++;
+    return wake = wakeAfterAsk;
+  }
+
   @override
   Future<void> showNotice({
     required int id,
@@ -455,6 +469,31 @@ void main() {
     await a.allowNotifications();
     expect(platform.settingsCalls, 0);
     expect(a.notificationsBlocked, isFalse);
+  });
+
+  test('iPhone の「閉じても 受け取る」は、起動時と前面に戻ったときに状態を確かめ、頼むと許可を求める', () async {
+    final platform = FakePlatform()..wake = BackgroundWake.notAsked;
+    final a = make('A', index: 1, platform: platform);
+    await a.init();
+    await Future<void>.delayed(Duration.zero);
+    expect(a.backgroundWake, BackgroundWake.notAsked);
+
+    platform.wakeAfterAsk = BackgroundWake.needsAlways;
+    expect(await a.enableBackgroundWake(), BackgroundWake.needsAlways);
+    expect(a.backgroundWake, BackgroundWake.needsAlways);
+
+    // 設定で「常に」に変えて戻ってくる。
+    a.setForeground(false);
+    platform.wake = BackgroundWake.on;
+    a.setForeground(true);
+    await Future<void>.delayed(Duration.zero);
+    expect(a.backgroundWake, BackgroundWake.on);
+    expect(platform.wakeRequests, 1);
+
+    // Android・Mac では出さない。
+    final b = make('B', index: 2);
+    await b.init();
+    expect(b.backgroundWake, BackgroundWake.unavailable);
   });
 
   test('OS 操作は PlatformActions に委譲され、なければ既定値', () async {

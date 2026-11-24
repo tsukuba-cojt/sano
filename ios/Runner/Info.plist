@@ -28,6 +28,10 @@
 	<true/>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>近くのスマートフォンと お知らせを 直接 やり取りするために Bluetooth を使います</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>アプリを 閉じていても、近くに 回覧板の 端末が 来たときに 起きて お知らせを 受け取るために 使います。場所は 記録も 送信も しません</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>近くに 回覧板の 端末が 来たことを 知るために 使います。場所は 記録も 送信も しません</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>近くのスマートフォンと お知らせを 直接 やり取りするために Bluetooth を使います</string>
 	<key>NSSupportsLiveActivities</key>
